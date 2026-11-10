@@ -267,6 +267,23 @@ def test_deleting_an_empty_folder_forgets_sources_still_marked_synced(
         assert path.is_file()
 
 
+def test_missing_raw_copy_is_new_even_when_the_ledger_still_tracks_it(tmp_path: Path) -> None:
+    """Stale synced_files entries from a delete that did not update the ledger."""
+    manager, kb_dir, folder_id, _source, sources = _synced_workbook(tmp_path)
+    for path in (kb_dir / "raw" / "01-Basic-Arithmetic-Workbook").glob("*.md"):
+        path.unlink()
+    originals = {path: path.read_bytes() for path in sources}
+
+    changes = manager.detect_folder_changes("math", folder_id)
+
+    assert changes["new_files"] == sorted(str(path) for path in sources)
+    assert changes["modified_files"] == []
+    assert changes["has_changes"] is True
+    for path, payload in originals.items():
+        assert path.read_bytes() == payload
+    assert manager.get_linked_folders("math")[0]["file_count"] == 3
+
+
 def test_unlink_removes_only_the_source_registration(tmp_path: Path) -> None:
     manager, _metadata_file, folder_id, _doc = _manager_with_linked_folder(tmp_path)
     kb_dir = manager.base_dir / "kb"

@@ -182,7 +182,18 @@ def _discard_raw_directory(raw_dir: Path, folder: Path) -> None:
 
 
 def _linked_source_relative(source: str, root: Path) -> str | None:
-    """Return ``source`` relative to a linked-folder root, if it lives there."""
+    """Return ``source`` relative to a linked-folder root, if it lives there.
+
+    String prefix is tried before ``resolve()``. A bind mount can make
+    ``resolve()`` rewrite the source and the folder root onto different
+    paths, and a missing comparison then leaves the sync ledger untouched
+    while the staged copy is still deleted.
+    """
+    source_norm = source.replace("\\", "/").rstrip("/")
+    root_norm = str(root).replace("\\", "/").rstrip("/")
+    if root_norm and (source_norm == root_norm or source_norm.startswith(root_norm + "/")):
+        relative = source_norm[len(root_norm) :].lstrip("/")
+        return relative or None
     try:
         candidate = Path(source).expanduser().resolve()
         root_resolved = root.expanduser().resolve()
@@ -191,6 +202,43 @@ def _linked_source_relative(source: str, root: Path) -> str | None:
     if candidate == root_resolved or not candidate.is_relative_to(root_resolved):
         return None
     return candidate.relative_to(root_resolved).as_posix()
+
+
+def raw_document_rels(raw_dir: Path) -> set[str]:
+    """POSIX paths of real files under ``raw/``, skipping symlinks."""
+    if not raw_dir.is_dir():
+        return set()
+    root = raw_dir.resolve()
+    rels: set[str] = set()
+    for path in raw_dir.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            rels.add(path.resolve().relative_to(root).as_posix())
+        except ValueError:
+            rels.add(path.relative_to(raw_dir).as_posix())
+    return rels
+
+
+def _source_names_removed_raw(source: str, files: set[str], prefixes: set[str]) -> bool:
+    """True when ``source`` names a raw path or folder that this delete removes."""
+    if any(_source_matches_raw_rel(source, rel) for rel in files):
+        return True
+    slash = chr(92)
+    norm = "/" + source.replace(slash, "/") + "/"
+    return any(
+        prefix and (f"/{prefix}/" in norm or norm.rstrip("/").endswith("/" + prefix))
+        for prefix in prefixes
+    )
+
+
+def _source_matches_raw_rel(source: str, rel: str) -> bool:
+    """True when a synced source path names the staged ``rel`` path."""
+    norm = source.replace("\\", "/")
+    relative = rel.replace("\\", "/").lstrip("/")
+    if not relative:
+        return False
+    return norm == relative or norm.endswith("/" + relative)
 
 
 def _relative_path_selected(rel_path: str, files: set[str], prefixes: set[str]) -> bool:
@@ -202,21 +250,40 @@ def _relative_path_selected(rel_path: str, files: set[str], prefixes: set[str]) 
     )
 
 
+def source_still_staged(source: str, root: str, raw_rels: set[str]) -> bool:
+    """Public alias used by linked-folder change detection."""
+    return _source_still_staged(source, root, raw_rels)
+
+
+def _source_still_staged(source: str, root: str, raw_rels: set[str]) -> bool:
+    """True when ``source`` still has a real file under ``raw/``."""
+    relative = _linked_source_relative(source, Path(root))
+    if relative and relative in raw_rels:
+        return True
+    return any(_source_matches_raw_rel(source, rel) for rel in raw_rels)
+
+
 def _forget_linked_folder_sources(
     metadata: dict,
     files: set[str],
     prefixes: set[str],
+    *,
+    raw_dir: Path | None = None,
 ) -> bool:
-    """Drop deleted raw paths from every linked folder's sync ledger.
+    """Drop sync-ledger entries that no longer have a staged copy.
 
     ``synced_files`` is what the next scan uses to decide a source is already
-    imported. Leaving a deleted KB file in that map makes Sync now report
-    nothing to do, even though ``raw/`` no longer has the copy. The source
-    path itself is only a key here — this never deletes the user's file.
+    imported. The map is keyed by the user's original path, which may be the
+    linked-folder path or, for an older sync, the staged path. After the raw
+    copy is gone, every entry that does not still name a file under ``raw/``
+    is removed — including entries left behind by a delete that predates this
+    bookkeeping. The source path itself is only a key here; the user's file
+    is never deleted.
     """
     folders = metadata.get("linked_folders")
-    if not isinstance(folders, list) or (not files and not prefixes):
+    if not isinstance(folders, list):
         return False
+    raw_rels = raw_document_rels(raw_dir) if raw_dir is not None else None
     changed = False
     for folder in folders:
         if not isinstance(folder, dict):
@@ -232,7 +299,11 @@ def _forget_linked_folder_sources(
                 kept[source] = mtime
                 continue
             relative = _linked_source_relative(source, Path(root))
-            if relative is not None and _relative_path_selected(relative, files, prefixes):
+            selected = relative is not None and _relative_path_selected(relative, files, prefixes)
+            if not selected:
+                selected = _source_names_removed_raw(source, files, prefixes)
+            stale = raw_rels is not None and not _source_still_staged(source, root, raw_rels)
+            if selected or stale:
                 dropped = True
                 continue
             kept[source] = mtime
@@ -277,7 +348,9 @@ def remove_raw_documents(
                 del hashes[hash_key]
                 indexed.add(hash_key)
                 changed = True
-    forgotten = _forget_linked_folder_sources(metadata, set(hash_keys), prefixes)
+    forgotten = _forget_linked_folder_sources(
+        metadata, set(hash_keys), prefixes, raw_dir=raw_dir
+    )
     if forgotten or changed:
         _write_metadata(metadata_file, metadata)
     return [

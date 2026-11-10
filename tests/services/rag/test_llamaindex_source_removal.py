@@ -167,6 +167,60 @@ def test_dropping_every_source_publishes_an_empty_active_index(tmp_path: Path) -
     assert _hits(kb_dir, _DELETED) == set()
 
 
+def test_source_absolute_paths_match_the_raw_relative_path(tmp_path: Path) -> None:
+    """Chunks indexed from the linked source path, not from raw/, still drop.
+
+    ``file_path`` on those nodes is ``/mnt/documents/.../01-Basic/a.pdf``. It
+    does not resolve under raw/, so a raw-relative comparison used to remove
+    nothing and leave the published version untouched.
+    """
+    kb_dir = tmp_path / "math"
+    raw_dir = kb_dir / "raw"
+    kept_path = raw_dir / "other.md"
+    kept_path.parent.mkdir(parents=True)
+    kept_path.write_text("other", encoding="utf-8")
+    nodes = [
+        TextNode(
+            text="front",
+            metadata={
+                "file_name": "00-Front-Matter.pdf",
+                "file_path": "/mnt/documents/math/01-Basic-Arithmetic-Workbook/00-Front-Matter.pdf",
+            },
+        ),
+        TextNode(
+            text="other",
+            metadata={"file_name": "other.md", "file_path": str(kept_path.resolve()), "document_key": "other.md"},
+        ),
+    ]
+    for node, vector in zip(nodes, (_DELETED, _KEPT)):
+        node.embedding = list(vector)
+    _publish(kb_dir, nodes, faiss=False)
+
+    removed = storage.drop_sources_from_active_index(
+        kb_dir, {"01-Basic-Arithmetic-Workbook/00-Front-Matter.pdf"}
+    )
+
+    assert removed == 1
+    assert _active_count(kb_dir) == 1
+    assert _hits(kb_dir, _KEPT) == {"other.md"}
+
+
+def test_empty_raw_set_drops_chunks_whose_paths_do_not_match(tmp_path: Path) -> None:
+    kb_dir = tmp_path / "math"
+    (kb_dir / "raw").mkdir(parents=True)
+    node = TextNode(
+        text="orphan",
+        metadata={"file_name": "mystery.pdf", "file_path": "/tmp/not-in-this-kb/mystery.pdf"},
+    )
+    node.embedding = list(_DELETED)
+    _publish(kb_dir, [node], faiss=False)
+
+    removed = storage.republish_index_for_raw_files(kb_dir, set())
+
+    assert removed == 1
+    assert _active_count(kb_dir) == 0
+
+
 def test_drop_is_a_no_op_when_the_index_has_no_matching_source(tmp_path: Path) -> None:
     kb_dir = tmp_path / "math"
     raw_dir = kb_dir / "raw"

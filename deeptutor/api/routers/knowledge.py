@@ -1230,6 +1230,25 @@ async def run_upload_processing_task(
                 accepted_indexing_snapshot=accepted_indexing_snapshot,
             )
 
+            # A linked-folder sync can re-import sources whose staged copies
+            # were deleted earlier. Drop chunks that no longer have a file
+            # under raw/ before those copies are staged again, so the re-import
+            # does not sit beside the old vectors. An empty raw/ clears the
+            # active index.
+            if folder_id and (rag_provider or DEFAULT_PROVIDER) == DEFAULT_PROVIDER:
+                from deeptutor.knowledge.add_documents import raw_document_rels
+                from deeptutor.services.rag.factory import get_pipeline
+
+                retained = sorted(raw_document_rels(Path(base_dir) / kb_name / "raw"))
+                removed_nodes = await get_pipeline(
+                    DEFAULT_PROVIDER, kb_base_dir=str(base_dir)
+                ).retain_raw_files(kb_name, retained)
+                if removed_nodes:
+                    _task_log(
+                        task_id,
+                        f"Removed {removed_nodes} indexed node(s) whose files are no longer in raw/",
+                    )
+
             # Staging blocks: a full-content hash per file, plus a copy for
             # anything not already under raw/. A BackgroundTasks entry declared
             # ``async def`` is awaited ON the event loop — starlette only routes
@@ -3346,17 +3365,32 @@ async def _purge_indexed_sources(
     left alone so an error-state base can still drop an unparseable file.
     """
     if provider == DEFAULT_PROVIDER:
+        from deeptutor.knowledge.add_documents import raw_document_rels
         from deeptutor.services.rag.factory import get_pipeline
         from deeptutor.services.rag.pipelines.llamaindex.pipeline import IndexingStallError
 
+        # The index lives next to this KB's raw files. Pass that directory's
+        # parent explicitly so a workspace manager cannot rewrite a different
+        # copy than the one the route is about to unlink.
+        kb_dir = manager.get_knowledge_base_path(kb_name)
+        retained = raw_document_rels(kb_dir / "raw")
+        removed = {path.strip("/") for path in relative_paths if path}
+        prefixes = {path.strip("/") for path in (directory_prefixes or []) if path}
+        for rel in list(retained):
+            if rel in removed or any(rel == prefix or rel.startswith(prefix + "/") for prefix in prefixes):
+                retained.discard(rel)
         try:
-            await get_pipeline(provider, kb_base_dir=str(manager.base_dir)).remove_documents(
-                kb_name,
-                relative_paths,
-                directory_prefixes=directory_prefixes,
-            )
+            removed_nodes = await get_pipeline(
+                provider, kb_base_dir=str(kb_dir.parent)
+            ).retain_raw_files(kb_name, sorted(retained))
         except IndexingStallError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if removed_nodes:
+            logger.info(
+                "KB '%s' delete republished the LlamaIndex without %s node(s)",
+                kb_name,
+                removed_nodes,
+            )
         return
     if provider in {PAGEINDEX_PROVIDER, PAGEINDEX_OSS_PROVIDER}:
         from deeptutor.services.rag.factory import get_pipeline

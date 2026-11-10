@@ -626,3 +626,31 @@ class LlamaIndexPipeline:
                 kb_name,
             )
         return removed
+
+    async def retain_raw_files(self, kb_name: str, retained: list[str]) -> int:
+        """Republish the active index so it only describes ``retained`` raw paths.
+
+        An empty list publishes an empty index. Used when a delete removes the
+        last staged documents, and before a linked-folder sync re-imports
+        sources whose copies are already gone.
+        """
+        kb_dir = resolve_kb_dir(self.kb_base_dir, kb_name)
+        worker_key = str(kb_dir.resolve())
+        _ensure_index_worker_available(worker_key)
+
+        def _work() -> int:
+            marker = _claim_index_worker(worker_key)
+            try:
+                return storage.republish_index_for_raw_files(kb_dir, set(retained))
+            finally:
+                _release_index_worker(worker_key, marker)
+
+        removed = await asyncio.to_thread(_work)
+        if removed:
+            self.logger.info(
+                "Republished KB '%s' index without %s node(s); %s raw file(s) remain",
+                kb_name,
+                removed,
+                len(retained),
+            )
+        return removed

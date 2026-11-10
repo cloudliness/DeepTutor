@@ -162,6 +162,100 @@ def test_delete_one_synced_file_makes_the_next_sync_see_it(monkeypatch, tmp_path
     assert _active_doc_count(kb_dir) == 3
 
 
+def _source_backed_node(text: str, source_path: str) -> TextNode:
+    """A chunk whose only location is the linked source, the shape left by older indexes."""
+    node = TextNode(text=text, metadata={"file_name": Path(source_path).name, "file_path": source_path})
+    node.embedding = [1.0, 0.0, 0.0, 0.0]
+    return node
+
+
+def test_delete_last_file_clears_source_keyed_chunks_and_stale_ledger(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The live failure: only Front-Matter was still in raw/, but the index and
+    synced_files still described all three PDFs by their /mnt source paths.
+    """
+    manager, kb_dir, _folder_id, originals = _seed(monkeypatch, tmp_path)
+    workbook = kb_dir / "raw" / "01-Basic-Arithmetic-Workbook"
+    for name in ("two.md", "three.md"):
+        (workbook / name).unlink()
+    (kb_dir / "raw" / "other.md").unlink()
+    version = kb_dir / "version-1"
+    for child in version.iterdir():
+        child.unlink()
+    source_root = "/mnt/documents/math"
+    nodes = [
+        _source_backed_node(name, f"{source_root}/01-Basic-Arithmetic-Workbook/{name}")
+        for name in ("one.md", "two.md", "three.md")
+    ]
+    VectorStoreIndex(nodes=nodes, embed_model=Settings.embed_model, show_progress=False).storage_context.persist(
+        persist_dir=str(version)
+    )
+    metadata_path = kb_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["linked_folders"][0]["synced_files"] = {
+        f"{source_root}/01-Basic-Arithmetic-Workbook/{name}": "2026-11-10T19:00:00"
+        for name in ("one.md", "two.md", "three.md")
+    }
+    metadata["linked_folders"][0]["file_count"] = 3
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    assert _active_doc_count(kb_dir) == 3
+
+    with TestClient(_build_app()) as client:
+        deleted = client.delete(
+            "/api/knowledge-bases/math/files/01-Basic-Arithmetic-Workbook/one.md"
+        )
+
+    assert deleted.status_code == 200, deleted.text
+    assert _active_doc_count(kb_dir) == 0
+    folder = manager.get_linked_folders("math")[0]
+    assert folder["synced_files"] == {}
+    assert folder["file_count"] == 0
+    for path, payload in originals.items():
+        assert path.read_bytes() == payload
+    assert list((kb_dir / "raw").rglob("*.md")) == []
+
+
+def test_delete_one_file_keeps_sibling_chunks_stored_by_source_path(
+    monkeypatch, tmp_path: Path
+) -> None:
+    manager, kb_dir, _folder_id, originals = _seed(monkeypatch, tmp_path)
+    version = kb_dir / "version-1"
+    for child in version.iterdir():
+        child.unlink()
+    source_root = "/mnt/documents/math"
+    nodes = []
+    for name in ("one.md", "two.md"):
+        node = _source_backed_node(name, f"{source_root}/01-Basic-Arithmetic-Workbook/{name}")
+        nodes.append(node)
+    VectorStoreIndex(nodes=nodes, embed_model=Settings.embed_model, show_progress=False).storage_context.persist(
+        persist_dir=str(version)
+    )
+    metadata_path = kb_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["linked_folders"][0]["synced_files"] = {
+        f"{source_root}/01-Basic-Arithmetic-Workbook/one.md": "2026-11-10T19:00:00",
+        f"{source_root}/01-Basic-Arithmetic-Workbook/two.md": "2026-11-10T19:00:00",
+        f"{source_root}/01-Basic-Arithmetic-Workbook/already-gone.md": "2026-11-10T18:00:00",
+    }
+    metadata["linked_folders"][0]["file_count"] = 3
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with TestClient(_build_app()) as client:
+        deleted = client.delete(
+            "/api/knowledge-bases/math/files/01-Basic-Arithmetic-Workbook/one.md"
+        )
+
+    assert deleted.status_code == 200, deleted.text
+    assert _active_doc_count(kb_dir) == 1
+    folder = manager.get_linked_folders("math")[0]
+    assert list(folder["synced_files"]) == [f"{source_root}/01-Basic-Arithmetic-Workbook/two.md"]
+    assert folder["file_count"] == 1
+    assert (kb_dir / "raw" / "01-Basic-Arithmetic-Workbook" / "two.md").is_file()
+    for path, payload in originals.items():
+        assert path.read_bytes() == payload
+
+
 def test_delete_folder_reports_removed_files_and_leaves_siblings(
     monkeypatch, tmp_path: Path
 ) -> None:
