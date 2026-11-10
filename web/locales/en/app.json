@@ -5116,6 +5116,7 @@
   "Delete?": "Delete?",
   "Confirm delete": "Confirm delete",
   "Delete file": "Delete file",
+  "Delete folder": "Delete folder",
   "GitHub Sources": "GitHub Sources",
   "Track a GitHub repo's Markdown docs. DeepTutor auto-syncs daily; you can also trigger a sync manually.": "Track a GitHub repo's Markdown docs. DeepTutor auto-syncs daily; you can also trigger a sync manually.",
   "Repo (owner/name)": "Repo (owner/name)",

@@ -625,6 +625,257 @@ def retrieve_nodes(
     return retrievers.retrieve_scoped_nodes(index, query, document_keys, top_k=top_k)
 
 
+def _node_source_keys(node: Any, raw_dir: Path) -> set[str]:
+    """Raw-relative paths a stored node claims as its source."""
+    metadata = getattr(node, "metadata", None)
+    if not isinstance(metadata, dict):
+        return set()
+    keys: set[str] = set()
+    document_key = metadata.get("document_key")
+    if isinstance(document_key, str) and document_key.strip():
+        keys.add(document_key.replace("\\", "/").lstrip("/"))
+    file_path = metadata.get("file_path")
+    if isinstance(file_path, str) and file_path.strip():
+        path = Path(file_path)
+        if path.is_absolute():
+            try:
+                keys.add(path.resolve().relative_to(raw_dir.resolve()).as_posix())
+            except (OSError, ValueError):
+                pass
+        else:
+            keys.add(path.as_posix().lstrip("./"))
+    return keys
+
+
+def _source_selected(keys: set[str], files: set[str], prefixes: set[str]) -> bool:
+    for key in keys:
+        if key in files:
+            return True
+        if any(prefix and (key == prefix or key.startswith(prefix + "/")) for prefix in prefixes):
+            return True
+    return False
+
+
+def _stored_embeddings(index: Any) -> dict[str, list[float]]:
+    """Reuse vectors already stored on the active index.
+
+    FAISS has no delete operation, and the docstore strips embeddings to avoid
+    storing them twice. Reconstruction is what lets a deletion republish the
+    remaining chunks without calling the embedding provider.
+    """
+    documents = getattr(getattr(index, "docstore", None), "docs", None) or {}
+    store = getattr(index, "vector_store", None)
+    data = getattr(getattr(store, "data", None), "embedding_dict", None)
+    if isinstance(data, dict) and data:
+        return {str(node_id): list(vector) for node_id, vector in data.items()}
+    faiss_index = getattr(store, "_faiss_index", None)
+    nodes_dict = getattr(getattr(index, "index_struct", None), "nodes_dict", None)
+    if faiss_index is not None and isinstance(nodes_dict, dict):
+        found: dict[str, list[float]] = {}
+        for vector_id, node_id in nodes_dict.items():
+            if node_id not in documents:
+                continue
+            found[str(node_id)] = faiss_index.reconstruct(int(vector_id)).tolist()
+        return found
+    found = {}
+    for node in documents.values():
+        embedding = getattr(node, "embedding", None)
+        if embedding:
+            found[str(node.node_id)] = list(embedding)
+    return found
+
+
+def _stored_only_embedding() -> Any:
+    """An embedder that only accepts an empty batch.
+
+    LlamaIndex asks for embeddings even when every node already has one, and
+    that call is an empty list. Anything else means a vector was lost and the
+    deletion must stop instead of inventing a new embedding.
+    """
+    from llama_index.core.embeddings import BaseEmbedding
+
+    class _StoredVectorEmbedding(BaseEmbedding):
+        def get_text_embedding_batch(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
+            if not texts:
+                return []
+            raise RuntimeError(
+                "Removing a document reuses stored vectors and does not call "
+                "the embedding provider."
+            )
+
+        def _get_text_embedding(self, text: str) -> list[float]:
+            raise RuntimeError("document removal does not embed")
+
+        def _get_query_embedding(self, query: str) -> list[float]:
+            raise RuntimeError("document removal does not embed")
+
+        async def _aget_text_embedding(self, text: str) -> list[float]:
+            raise RuntimeError("document removal does not embed")
+
+        async def _aget_query_embedding(self, query: str) -> list[float]:
+            raise RuntimeError("document removal does not embed")
+
+    return _StoredVectorEmbedding()
+
+
+def _publish_kept_index(nodes: list[Any], storage_dir: Path) -> None:
+    """Persist ``nodes`` as a new index, refusing to embed anything."""
+    from llama_index.core import VectorStoreIndex
+
+    kwargs: dict[str, Any] = {
+        "nodes": nodes,
+        "embed_model": _stored_only_embedding(),
+        "show_progress": False,
+    }
+    if nodes:
+        context = vector_store.storage_context_for_nodes(nodes)
+        if context is not None:
+            kwargs["storage_context"] = context
+    rebuilt = VectorStoreIndex(**kwargs)
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    rebuilt.storage_context.persist(persist_dir=str(storage_dir))
+    if not nodes:
+        # An empty VectorStoreIndex persists ``{}``. The readiness probe only
+        # counts ``docstore/data``, so write that key or the active version
+        # reports no document count instead of zero.
+        atomic_write_json(
+            storage_dir / "docstore.json",
+            {"docstore/data": {}, "docstore/metadata": {}},
+        )
+    retrievers.persist_bm25_retriever(rebuilt, storage_dir, top_k=20)
+
+
+def _carry_page_catalog(
+    source_dir: Path,
+    dest_dir: Path,
+    files: set[str],
+    prefixes: set[str],
+) -> None:
+    catalog = source_dir / "source_pages.json"
+    if not catalog.is_file():
+        return
+    try:
+        payload = json.loads(catalog.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(payload, dict):
+        return
+    pages = payload.get("pages")
+    if not isinstance(pages, list):
+        return
+    kept_pages = []
+    for page in pages:
+        key = page.get("document_key") if isinstance(page, dict) else None
+        if isinstance(key, str) and _source_selected({key.replace("\\", "/")}, files, prefixes):
+            continue
+        kept_pages.append(page)
+    payload["pages"] = kept_pages
+    atomic_write_json(dest_dir / "source_pages.json", payload)
+
+
+def _publish_deletion_meta(source_dir: Path, dest_dir: Path) -> None:
+    """Copy the active version's identity onto the rewritten index."""
+    from datetime import datetime, timezone
+
+    meta: dict[str, Any] = {}
+    meta_path = source_dir / "meta.json"
+    if meta_path.is_file():
+        try:
+            loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            meta = loaded
+    for stale in ("storage_path", "version_path", "ready", "failure_summary"):
+        meta.pop(stale, None)
+    meta["version"] = dest_dir.name
+    meta["provider"] = meta.get("provider") or "llamaindex"
+    meta["layout"] = "flat"
+    meta["created_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+    meta["state"] = "published"
+    meta["readiness_verified"] = True
+    atomic_write_json(dest_dir / "meta.json", meta)
+
+
+def drop_sources_from_active_index(
+    kb_dir: Path,
+    relative_paths: set[str],
+    *,
+    directory_prefixes: set[str] | None = None,
+) -> int:
+    """Republish the active LlamaIndex without chunks from ``relative_paths``.
+
+    Returns how many vector nodes were dropped. A knowledge base with no ready
+    index is unchanged (an error-state KB can still delete its raw files).
+    When nothing in the active index matches, no new version is written.
+
+    FAISS cannot delete vectors in place, so the remaining nodes are rebuilt
+    into the next version directory from the embeddings already on disk. The
+    new version becomes the active one; older versions stay as history.
+    """
+    files = {path.strip("/") for path in relative_paths if path and path.strip("/")}
+    prefixes = {
+        prefix.strip("/")
+        for prefix in (directory_prefixes or set())
+        if prefix and prefix.strip("/")
+    }
+    if not files and not prefixes:
+        return 0
+    storage_dir = resolve_storage_dir_for_read(kb_dir, None)
+    if storage_dir is None or not (storage_dir / "docstore.json").is_file():
+        return 0
+
+    index = vector_store.load_index(storage_dir, embed_model=_stored_only_embedding())
+    documents = getattr(getattr(index, "docstore", None), "docs", None) or {}
+    embeddings = _stored_embeddings(index)
+    nodes_dict = getattr(getattr(index, "index_struct", None), "nodes_dict", None) or {}
+    vector_node_ids = {str(node_id) for node_id in nodes_dict.values()}
+    vector_node_ids.update(embeddings)
+    raw_dir = kb_dir / "raw"
+    kept: list[Any] = []
+    removed = 0
+    missing_vectors: list[str] = []
+    for node in documents.values():
+        selected = _source_selected(_node_source_keys(node, raw_dir), files, prefixes)
+        node_id = str(getattr(node, "node_id", ""))
+        is_vector = node_id in vector_node_ids
+        if not is_vector:
+            # Parent documents are not vectors. Only vector nodes are republished.
+            if selected:
+                removed += 1
+            continue
+        if node_id not in embeddings:
+            if not selected:
+                missing_vectors.append(node_id)
+            else:
+                removed += 1
+            continue
+        if selected:
+            removed += 1
+            continue
+        copy = node.model_copy(deep=True)
+        copy.embedding = embeddings[node_id]
+        kept.append(copy)
+    if missing_vectors:
+        raise ValueError(
+            "Stored vectors are missing for "
+            f"{len(missing_vectors)} remaining node(s); the active index was left unchanged."
+        )
+    if removed == 0:
+        return 0
+
+    new_dir = resolve_storage_dir_for_rebuild(kb_dir, None, publication_guard=True)
+    try:
+        _publish_kept_index(kept, new_dir)
+        _carry_page_catalog(storage_dir, new_dir, files, prefixes)
+        _publish_deletion_meta(storage_dir, new_dir)
+    except Exception:
+        shutil.rmtree(new_dir, ignore_errors=True)
+        raise
+    clear_index_cache()
+    return removed
+
+
 def delete_kb_dir(kb_dir: Path) -> bool:
     if kb_dir.exists():
         shutil.rmtree(kb_dir)

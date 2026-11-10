@@ -4984,6 +4984,7 @@
   "Delete?": "Xóa?",
   "Confirm delete": "Xác nhận xóa",
   "Delete file": "Xóa tệp",
+  "Delete folder": "Xóa thư mục",
   "GitHub Sources": "Nguồn GitHub",
   "Track a GitHub repo's Markdown docs. DeepTutor auto-syncs daily; you can also trigger a sync manually.": "Theo dõi các tài liệu Markdown của một kho GitHub. DeepTutor tự động đồng bộ hằng ngày; bạn cũng có thể kích hoạt đồng bộ thủ công.",
   "Repo (owner/name)": "Kho (chủ sở hữu/tên)",

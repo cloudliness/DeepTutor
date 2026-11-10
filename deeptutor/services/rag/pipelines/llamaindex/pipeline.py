@@ -590,3 +590,39 @@ class LlamaIndexPipeline:
         if deleted:
             self.logger.info(f"Deleted KB '{kb_name}'")
         return deleted
+
+    async def remove_documents(
+        self,
+        kb_name: str,
+        relative_paths: list[str],
+        *,
+        directory_prefixes: list[str] | None = None,
+    ) -> int:
+        """Drop chunks for raw-relative paths from the active index.
+
+        Rewriting the index does not embed. A knowledge base with no ready
+        index returns 0 so an error-state KB can still delete raw files.
+        """
+        kb_dir = resolve_kb_dir(self.kb_base_dir, kb_name)
+        worker_key = str(kb_dir.resolve())
+        _ensure_index_worker_available(worker_key)
+
+        def _work() -> int:
+            marker = _claim_index_worker(worker_key)
+            try:
+                return storage.drop_sources_from_active_index(
+                    kb_dir,
+                    set(relative_paths),
+                    directory_prefixes=set(directory_prefixes or ()),
+                )
+            finally:
+                _release_index_worker(worker_key, marker)
+
+        removed = await asyncio.to_thread(_work)
+        if removed:
+            self.logger.info(
+                "Removed %s indexed node(s) from KB '%s'",
+                removed,
+                kb_name,
+            )
+        return removed

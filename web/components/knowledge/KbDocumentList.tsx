@@ -213,8 +213,14 @@ export default function KbDocumentList({
     setBusy(true);
     try {
       await deleteKbFile(kbName, path);
-      // Drop the preview if the deleted file was the one being shown.
-      if (selectedFile === path) onSelect(null);
+      // Drop the preview if it showed the deleted file or anything inside a
+      // deleted folder.
+      if (
+        selectedFile === path ||
+        (selectedFile?.startsWith(`${path}/`) ?? false)
+      ) {
+        onSelect(null);
+      }
       await load(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -273,7 +279,7 @@ export default function KbDocumentList({
       const open = expanded.has(node.path);
       const isDrop = dropTarget === node.path;
       return (
-        <li key={`d:${node.path}`}>
+        <li key={`d:${node.path}`} className="group/row relative">
           <div
             onClick={() => toggleFolder(node.path)}
             onDragOver={(e) => {
@@ -291,7 +297,7 @@ export default function KbDocumentList({
               if (src) void handleMove(src, node.path);
             }}
             style={indent}
-            className={`flex cursor-pointer items-center gap-1 rounded-md py-1.5 pr-2 text-left transition-colors ${
+            className={`flex cursor-pointer items-center gap-1 rounded-md py-1.5 pr-1 text-left transition-colors ${
               isDrop
                 ? "bg-[var(--primary)]/15 ring-1 ring-[var(--primary)]/40"
                 : "hover:bg-[var(--muted)]/50"
@@ -303,9 +309,57 @@ export default function KbDocumentList({
               <ChevronRight className="h-3 w-3 shrink-0 text-[var(--muted-foreground)]" />
             )}
             <Folder className="h-3.5 w-3.5 shrink-0 text-[var(--muted-foreground)]" />
-            <span className="truncate text-[12px] font-medium text-[var(--foreground)]">
+            <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-[var(--foreground)]">
               {node.name}
             </span>
+            {confirmDeleteFor === node.path ? (
+              <div
+                className="flex shrink-0 items-center gap-0.5 pr-0.5"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <span className="px-0.5 text-[10px] font-medium text-red-600 dark:text-red-400">
+                  {t("Delete?")}
+                </span>
+                <Tooltip label={t("Confirm delete")} side="top">
+                  <button
+                    type="button"
+                    onClick={() => void handleDelete(node.path)}
+                    disabled={busy}
+                    aria-label={t("Confirm delete")}
+                    className="rounded p-1 text-red-600 transition-colors hover:bg-red-50 disabled:opacity-40 dark:text-red-400 dark:hover:bg-red-950/40"
+                  >
+                    <Check className="h-3.5 w-3.5" />
+                  </button>
+                </Tooltip>
+                <Tooltip label={t("Cancel")} side="top">
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDeleteFor(null)}
+                    aria-label={t("Cancel")}
+                    className="rounded p-1 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </Tooltip>
+              </div>
+            ) : (
+              <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover/row:opacity-100">
+                <Tooltip label={t("Delete folder")} side="top">
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setMoveMenuFor(null);
+                      setConfirmDeleteFor(node.path);
+                    }}
+                    aria-label={t("Delete folder")}
+                    className="rounded p-1 text-[var(--muted-foreground)] transition-colors hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/40 dark:hover:text-red-400"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </Tooltip>
+              </div>
+            )}
           </div>
           {open && node.children.length > 0 && (
             <ul className="space-y-px">

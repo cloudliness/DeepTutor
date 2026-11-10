@@ -15,7 +15,9 @@ from pathlib import Path
 
 from deeptutor.api.routers.knowledge import LinkedFolderInfo
 from deeptutor.knowledge import manager as manager_module
+from deeptutor.knowledge.add_documents import remove_raw_document, remove_raw_tree
 from deeptutor.knowledge.manager import KnowledgeBaseManager
+from deeptutor.utils.file_types import FileTypeRouter
 
 
 def _manager_with_linked_folder(tmp_path: Path) -> tuple[KnowledgeBaseManager, Path, str, Path]:
@@ -136,6 +138,133 @@ def test_update_folder_sync_state_mtime_failure_is_visible_not_fake_synced(
     assert str(doc) not in folder["synced_files"]
     assert folder["file_count"] == 0
     assert manager.detect_folder_changes("kb", folder_id)["new_files"] == [str(doc)]
+
+
+def _synced_workbook(tmp_path: Path):
+    """A KB whose raw copies came from a linked ``01-Basic-Arithmetic-Workbook``."""
+    manager = KnowledgeBaseManager(base_dir=str(tmp_path / "kbs"))
+    kb_dir = manager.base_dir / "math"
+    (kb_dir / "raw").mkdir(parents=True)
+    manager.register_knowledge_base("math")
+
+    source = tmp_path / "documents" / "math"
+    workbook = source / "01-Basic-Arithmetic-Workbook"
+    workbook.mkdir(parents=True)
+    sources = []
+    for name in ("one.md", "two.md", "three.md"):
+        path = workbook / name
+        path.write_text(name, encoding="utf-8")
+        sources.append(path)
+        dest = kb_dir / "raw" / "01-Basic-Arithmetic-Workbook" / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(name, encoding="utf-8")
+    (kb_dir / "raw" / "other.md").write_text("other", encoding="utf-8")
+
+    folder = manager.link_folder("math", str(source))
+    collected = [
+        str(path) for path in FileTypeRouter.collect_supported_files(source, recursive=True)
+    ]
+    manager.update_folder_sync_state("math", folder["id"], collected)
+    metadata_file = kb_dir / "metadata.json"
+    metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+    metadata["file_hashes"] = {
+        "01-Basic-Arithmetic-Workbook/one.md": "one",
+        "01-Basic-Arithmetic-Workbook/two.md": "two",
+        "01-Basic-Arithmetic-Workbook/three.md": "three",
+        "other.md": "other",
+    }
+    metadata_file.write_text(json.dumps(metadata), encoding="utf-8")
+    return manager, kb_dir, folder["id"], source, sources
+
+
+def _synced_relative_paths(manager: KnowledgeBaseManager) -> set[str]:
+    folder = manager.get_linked_folders("math")[0]
+    root = Path(folder["path"]).resolve()
+    return {
+        Path(source).resolve().relative_to(root).as_posix()
+        for source in folder.get("synced_files", {})
+    }
+
+
+def test_deleting_a_synced_raw_file_is_new_on_the_next_scan(tmp_path: Path) -> None:
+    manager, kb_dir, folder_id, source, sources = _synced_workbook(tmp_path)
+    original = sources[0].read_bytes()
+    raw_copy = kb_dir / "raw" / "01-Basic-Arithmetic-Workbook" / "one.md"
+
+    removal = remove_raw_document(kb_dir, raw_copy)
+
+    assert removal.was_indexed is True
+    assert removal.rel_path == "01-Basic-Arithmetic-Workbook/one.md"
+    assert not raw_copy.exists()
+    assert sources[0].read_bytes() == original
+    assert (kb_dir / "raw" / "01-Basic-Arithmetic-Workbook" / "two.md").is_file()
+    folder = manager.get_linked_folders("math")[0]
+    assert _synced_relative_paths(manager) == {
+        "01-Basic-Arithmetic-Workbook/two.md",
+        "01-Basic-Arithmetic-Workbook/three.md",
+    }
+    assert folder["file_count"] == 2
+    changes = manager.detect_folder_changes("math", folder_id)
+    assert changes["new_files"] == [str(sources[0])]
+    assert changes["modified_files"] == []
+    assert source.is_dir()
+
+
+def test_deleting_a_raw_folder_forgets_sync_state_and_keeps_the_source(
+    tmp_path: Path,
+) -> None:
+    manager, kb_dir, folder_id, source, sources = _synced_workbook(tmp_path)
+    originals = {path: path.read_bytes() for path in sources}
+    external = tmp_path / "secret.md"
+    external.write_text("do not delete", encoding="utf-8")
+    link = kb_dir / "raw" / "01-Basic-Arithmetic-Workbook" / "link.md"
+    link.symlink_to(external)
+
+    removal = remove_raw_tree(kb_dir, kb_dir / "raw" / "01-Basic-Arithmetic-Workbook")
+
+    assert removal.rel_path == "01-Basic-Arithmetic-Workbook"
+    assert set(removal.removed_files) == {
+        "01-Basic-Arithmetic-Workbook/one.md",
+        "01-Basic-Arithmetic-Workbook/two.md",
+        "01-Basic-Arithmetic-Workbook/three.md",
+    }
+    assert removal.was_indexed is True
+    assert not (kb_dir / "raw" / "01-Basic-Arithmetic-Workbook").exists()
+    assert (kb_dir / "raw" / "other.md").read_text(encoding="utf-8") == "other"
+    assert external.read_text(encoding="utf-8") == "do not delete"
+    for path, payload in originals.items():
+        assert path.read_bytes() == payload
+    folder = manager.get_linked_folders("math")[0]
+    assert folder["synced_files"] == {}
+    assert folder["file_count"] == 0
+    changes = manager.detect_folder_changes("math", folder_id)
+    assert changes["new_files"] == sorted(str(path) for path in sources)
+    assert changes["modified_files"] == []
+    metadata = json.loads((kb_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["file_hashes"] == {"other.md": "other"}
+
+
+def test_deleting_an_empty_folder_forgets_sources_still_marked_synced(
+    tmp_path: Path,
+) -> None:
+    """The leftover folder in the Files panel still owns the sync ledger."""
+    manager, kb_dir, folder_id, _source, sources = _synced_workbook(tmp_path)
+    workbook = kb_dir / "raw" / "01-Basic-Arithmetic-Workbook"
+    for path in workbook.glob("*.md"):
+        path.unlink()
+    assert manager.get_linked_folders("math")[0]["file_count"] == 3
+
+    remove_raw_tree(kb_dir, workbook)
+
+    assert not workbook.exists()
+    folder = manager.get_linked_folders("math")[0]
+    assert folder["synced_files"] == {}
+    assert folder["file_count"] == 0
+    assert manager.detect_folder_changes("math", folder_id)["new_files"] == sorted(
+        str(path) for path in sources
+    )
+    for path in sources:
+        assert path.is_file()
 
 
 def test_unlink_removes_only_the_source_registration(tmp_path: Path) -> None:

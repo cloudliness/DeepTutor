@@ -5000,6 +5000,7 @@
   "Delete?": "Löschen?",
   "Confirm delete": "Löschen bestätigen",
   "Delete file": "Datei löschen",
+  "Delete folder": "Ordner löschen",
   "GitHub Sources": "GitHub-Quellen",
   "Track a GitHub repo's Markdown docs. DeepTutor auto-syncs daily; you can also trigger a sync manually.": "Verfolge die Markdown-Dokumentation eines GitHub-Repos. DeepTutor synchronisiert automatisch täglich; du kannst eine Synchronisierung auch manuell auslösen.",
   "Repo (owner/name)": "Repo (Besitzer/Name)",

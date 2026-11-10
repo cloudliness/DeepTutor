@@ -4762,6 +4762,7 @@
   "Degraded": "Dégradé",
   "Delete all archived chats": "Supprimer toutes les conversations archivées",
   "Delete file": "Supprimer le fichier",
+  "Delete folder": "Supprimer le dossier",
   "Delete note at {{time}}": "Supprimer la note à {{time}}",
   "Delete persona \"{{name}}\"?": "Supprimer le persona « {{name}} » ?",
   "Delete this note?": "Supprimer cette note ?",

@@ -4985,6 +4985,7 @@
   "Delete?": "削除しますか？",
   "Confirm delete": "削除を確認",
   "Delete file": "ファイルを削除",
+  "Delete folder": "フォルダを削除",
   "GitHub Sources": "GitHub ソース",
   "Track a GitHub repo's Markdown docs. DeepTutor auto-syncs daily; you can also trigger a sync manually.": "GitHub リポジトリの Markdown ドキュメントを追跡します。DeepTutor は毎日自動で同期し、手動で同期することもできます。",
   "Repo (owner/name)": "リポジトリ（owner/name）",

@@ -4984,6 +4984,7 @@
   "Delete?": "Excluir?",
   "Confirm delete": "Confirmar exclusão",
   "Delete file": "Excluir arquivo",
+  "Delete folder": "Excluir pasta",
   "GitHub Sources": "Fontes do GitHub",
   "Track a GitHub repo's Markdown docs. DeepTutor auto-syncs daily; you can also trigger a sync manually.": "Acompanhe os documentos Markdown de um repositório GitHub. O DeepTutor sincroniza automaticamente todos os dias; você também pode iniciar uma sincronização manualmente.",
   "Repo (owner/name)": "Repositório (proprietário/nome)",

@@ -5017,6 +5017,7 @@
   "Delete?": "Видалити?",
   "Confirm delete": "Підтвердити видалення",
   "Delete file": "Видалити файл",
+  "Delete folder": "Видалити папку",
   "GitHub Sources": "Джерела GitHub",
   "Track a GitHub repo's Markdown docs. DeepTutor auto-syncs daily; you can also trigger a sync manually.": "Відстежуйте документи Markdown репо GitHub. DeepTutor щодня автоматично синхронізується; ви також можете запустити синхронізацію вручну.",
   "Repo (owner/name)": "Репо (власник/ім'я)",

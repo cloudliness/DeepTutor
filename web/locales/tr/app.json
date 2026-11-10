@@ -4985,6 +4985,7 @@
   "Delete?": "Silinsin mi?",
   "Confirm delete": "Silmeyi onayla",
   "Delete file": "Dosyayı sil",
+  "Delete folder": "Klasörü sil",
   "GitHub Sources": "GitHub kaynakları",
   "Track a GitHub repo's Markdown docs. DeepTutor auto-syncs daily; you can also trigger a sync manually.": "Bir GitHub deposunun Markdown belgelerini izleyin. DeepTutor her gün otomatik eşitler; eşitlemeyi elle de başlatabilirsiniz.",
   "Repo (owner/name)": "Depo (sahip/ad)",
