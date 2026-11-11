@@ -2136,6 +2136,12 @@ class KnowledgeBaseManager:
 
         folder_path = Path(folder_info["path"]).expanduser().resolve()
         synced_files = folder_info.get("synced_files", {})
+        # A source that is still marked synced but has no copy under raw/ was
+        # removed from the KB (including by a delete that predated ledger
+        # cleanup). The next sync has to import it again.
+        from deeptutor.knowledge.add_documents import raw_document_rels, source_still_staged
+
+        raw_rels = raw_document_rels(self.base_dir / kb_name / "raw")
 
         new_files = []
         modified_files = []
@@ -2143,6 +2149,25 @@ class KnowledgeBaseManager:
         for file_path in FileTypeRouter.collect_supported_files(folder_path, recursive=True):
             file_str = str(file_path)
             file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
+
+            if file_str in synced_files and not source_still_staged(
+                file_str, str(folder_path), raw_rels
+            ):
+                # A newer source mtime still has to win over "the copy is
+                # missing", so an edit saved while the previous sync was
+                # indexing stays visible as a modification. An unchanged
+                # source whose staged copy is gone is simply new again.
+                prev_mtime_str = synced_files.get(file_str)
+                try:
+                    prev_mtime = datetime.fromisoformat(prev_mtime_str)
+                except (TypeError, ValueError):
+                    modified_files.append(file_str)
+                    continue
+                if file_mtime > prev_mtime:
+                    modified_files.append(file_str)
+                else:
+                    new_files.append(file_str)
+                continue
 
             if file_str in synced_files:
                 # Check if modified since last sync

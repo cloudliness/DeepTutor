@@ -89,6 +89,15 @@ class RawDocumentRemoval:
     was_indexed: bool
 
 
+@dataclass(frozen=True)
+class RawTreeRemoval:
+    """Outcome of removing one organizational folder under ``raw/``."""
+
+    rel_path: str
+    removed_files: tuple[str, ...]
+    was_indexed: bool
+
+
 def _read_metadata(metadata_file: Path) -> dict:
     """Load a KB's metadata.json, returning {} when absent or unreadable."""
     if not metadata_file.exists():
@@ -128,35 +137,271 @@ def hashes_for_indexed_files(file_paths: list[str], raw_dir: Path) -> dict[str, 
     }
 
 
+def _assert_inside_raw(raw_dir: Path, path: Path) -> None:
+    """Refuse to delete a path whose parent resolves outside ``raw/``.
+
+    The leaf is not resolved, so a symlink inside ``raw/`` is removed as a
+    link. Following it would delete the user's original file when that link
+    points at a linked source folder.
+    """
+    raw_resolved = raw_dir.resolve()
+    parent = path.parent.resolve()
+    if parent != raw_resolved and not parent.is_relative_to(raw_resolved):
+        raise ValueError(f"Refusing to delete {path} outside {raw_dir}")
+
+
+def _unlink_raw_entry(raw_dir: Path, path: Path) -> None:
+    """Remove a file or symlink under ``raw/`` without following the leaf."""
+    if not path.is_symlink() and not path.is_file():
+        return
+    _assert_inside_raw(raw_dir, path)
+    path.unlink()
+
+
+def _discard_raw_directory(raw_dir: Path, folder: Path) -> None:
+    """Remove a directory under ``raw/`` and anything still inside it.
+
+    Symlinks are unlinked rather than walked, so a folder delete cannot reach
+    the linked source directory that produced these copies.
+    """
+    raw_resolved = raw_dir.resolve()
+    if folder.is_symlink():
+        _assert_inside_raw(raw_dir, folder)
+        folder.unlink()
+        return
+    folder_resolved = folder.resolve()
+    if folder_resolved == raw_resolved or not folder_resolved.is_relative_to(raw_resolved):
+        raise ValueError(f"Refusing to delete {folder} outside {raw_dir}")
+    children = sorted(folder.rglob("*"), key=lambda child: len(child.parts), reverse=True)
+    for child in children:
+        if child.is_symlink() or child.is_file():
+            child.unlink()
+        elif child.is_dir():
+            child.rmdir()
+    folder.rmdir()
+
+
+def _linked_source_relative(source: str, root: Path) -> str | None:
+    """Return ``source`` relative to a linked-folder root, if it lives there.
+
+    String prefix is tried before ``resolve()``. A bind mount can make
+    ``resolve()`` rewrite the source and the folder root onto different
+    paths, and a missing comparison then leaves the sync ledger untouched
+    while the staged copy is still deleted.
+    """
+    source_norm = source.replace("\\", "/").rstrip("/")
+    root_norm = str(root).replace("\\", "/").rstrip("/")
+    if root_norm and (source_norm == root_norm or source_norm.startswith(root_norm + "/")):
+        relative = source_norm[len(root_norm) :].lstrip("/")
+        return relative or None
+    try:
+        candidate = Path(source).expanduser().resolve()
+        root_resolved = root.expanduser().resolve()
+    except OSError:
+        return None
+    if candidate == root_resolved or not candidate.is_relative_to(root_resolved):
+        return None
+    return candidate.relative_to(root_resolved).as_posix()
+
+
+def raw_document_rels(raw_dir: Path) -> set[str]:
+    """POSIX paths of real files under ``raw/``, skipping symlinks."""
+    if not raw_dir.is_dir():
+        return set()
+    root = raw_dir.resolve()
+    rels: set[str] = set()
+    for path in raw_dir.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            rels.add(path.resolve().relative_to(root).as_posix())
+        except ValueError:
+            rels.add(path.relative_to(raw_dir).as_posix())
+    return rels
+
+
+def _source_names_removed_raw(source: str, files: set[str], prefixes: set[str]) -> bool:
+    """True when ``source`` names a raw path or folder that this delete removes."""
+    if any(_source_matches_raw_rel(source, rel) for rel in files):
+        return True
+    slash = chr(92)
+    norm = "/" + source.replace(slash, "/") + "/"
+    return any(
+        prefix and (f"/{prefix}/" in norm or norm.rstrip("/").endswith("/" + prefix))
+        for prefix in prefixes
+    )
+
+
+def _source_matches_raw_rel(source: str, rel: str) -> bool:
+    """True when a synced source path names the staged ``rel`` path."""
+    norm = source.replace("\\", "/")
+    relative = rel.replace("\\", "/").lstrip("/")
+    if not relative:
+        return False
+    return norm == relative or norm.endswith("/" + relative)
+
+
+def _relative_path_selected(rel_path: str, files: set[str], prefixes: set[str]) -> bool:
+    """True when ``rel_path`` is one of ``files`` or lives under a prefix."""
+    if rel_path in files:
+        return True
+    return any(
+        prefix and (rel_path == prefix or rel_path.startswith(prefix + "/")) for prefix in prefixes
+    )
+
+
+def source_still_staged(source: str, root: str, raw_rels: set[str]) -> bool:
+    """Public alias used by linked-folder change detection."""
+    return _source_still_staged(source, root, raw_rels)
+
+
+def _source_still_staged(source: str, root: str, raw_rels: set[str]) -> bool:
+    """True when ``source`` still has a real file under ``raw/``."""
+    relative = _linked_source_relative(source, Path(root))
+    if relative and relative in raw_rels:
+        return True
+    return any(_source_matches_raw_rel(source, rel) for rel in raw_rels)
+
+
+def _forget_linked_folder_sources(
+    metadata: dict,
+    files: set[str],
+    prefixes: set[str],
+    *,
+    raw_dir: Path | None = None,
+) -> bool:
+    """Drop sync-ledger entries that no longer have a staged copy.
+
+    ``synced_files`` is what the next scan uses to decide a source is already
+    imported. The map is keyed by the user's original path, which may be the
+    linked-folder path or, for an older sync, the staged path. After the raw
+    copy is gone, every entry that does not still name a file under ``raw/``
+    is removed — including entries left behind by a delete that predates this
+    bookkeeping. The source path itself is only a key here; the user's file
+    is never deleted.
+    """
+    folders = metadata.get("linked_folders")
+    if not isinstance(folders, list):
+        return False
+    raw_rels = raw_document_rels(raw_dir) if raw_dir is not None else None
+    changed = False
+    for folder in folders:
+        if not isinstance(folder, dict):
+            continue
+        states = folder.get("synced_files")
+        root = folder.get("path")
+        if not isinstance(states, dict) or not states or not isinstance(root, str) or not root:
+            continue
+        kept: dict = {}
+        dropped = False
+        for source, mtime in states.items():
+            if not isinstance(source, str):
+                kept[source] = mtime
+                continue
+            relative = _linked_source_relative(source, Path(root))
+            selected = relative is not None and _relative_path_selected(relative, files, prefixes)
+            if not selected:
+                selected = _source_names_removed_raw(source, files, prefixes)
+            stale = raw_rels is not None and not _source_still_staged(source, root, raw_rels)
+            if selected or stale:
+                dropped = True
+                continue
+            kept[source] = mtime
+        if dropped:
+            folder["synced_files"] = kept
+            folder["file_count"] = len(kept)
+            changed = True
+    return changed
+
+
+def remove_raw_documents(
+    kb_dir: Path,
+    file_paths: list[Path],
+    *,
+    directory_prefixes: set[str] | None = None,
+) -> list[RawDocumentRemoval]:
+    """Delete staged raw files, their hash records, and linked-folder sync keys.
+
+    One metadata write covers the whole batch. ``directory_prefixes`` also
+    forgets sync entries under a removed folder when the copies are already
+    gone (the empty-folder case) or when the caller is deleting the folder
+    itself. Provider vectors are not touched here.
+    """
+    raw_dir = kb_dir / "raw"
+    prefixes = {prefix.strip("/") for prefix in (directory_prefixes or set()) if prefix.strip("/")}
+    removals: list[RawDocumentRemoval] = []
+    hash_keys: list[str] = []
+    for file_path in file_paths:
+        hash_key = _raw_hash_key(file_path, raw_dir)
+        hash_keys.append(hash_key)
+        _unlink_raw_entry(raw_dir, file_path)
+        removals.append(RawDocumentRemoval(rel_path=hash_key, was_indexed=False))
+
+    metadata_file = kb_dir / "metadata.json"
+    metadata = _read_metadata(metadata_file)
+    hashes = metadata.get("file_hashes")
+    changed = False
+    indexed: set[str] = set()
+    if isinstance(hashes, dict):
+        for hash_key in hash_keys:
+            if hash_key in hashes:
+                del hashes[hash_key]
+                indexed.add(hash_key)
+                changed = True
+    forgotten = _forget_linked_folder_sources(
+        metadata, set(hash_keys), prefixes, raw_dir=raw_dir
+    )
+    if forgotten or changed:
+        _write_metadata(metadata_file, metadata)
+    return [
+        RawDocumentRemoval(rel_path=item.rel_path, was_indexed=item.rel_path in indexed)
+        for item in removals
+    ]
+
+
 def remove_raw_document(kb_dir: Path, file_path: Path) -> RawDocumentRemoval:
-    """Delete one staged raw file and drop its indexed-hash record.
+    """Delete one staged raw file and drop its indexed-hash and sync records.
 
     Deliberately decoupled from :class:`DocumentAdder` (whose constructor
     requires a ready provider index): a KB stuck in an *error* state often has
     no index at all, yet its raw/ files must still be removable so the user can
     drop an unparseable document instead of deleting and rebuilding the whole
-    KB. Vectors are not touched here — the providers index whole KBs, so any
-    vectors from an already-indexed file are cleared by a subsequent re-index,
-    which the returned ``was_indexed`` flag lets the caller surface.
+    KB. LlamaIndex chunk removal is the router's job, because rewriting the
+    active index needs the provider pipeline. The returned ``was_indexed``
+    flag still reports whether a hash record existed.
 
     ``file_path`` must already be sandbox-resolved under the KB's raw/ dir.
+    The linked source file, if this copy came from one, is left in place.
+    """
+    return remove_raw_documents(kb_dir, [file_path])[0]
+
+
+def remove_raw_tree(kb_dir: Path, folder: Path) -> RawTreeRemoval:
+    """Delete an organizational folder under ``raw/`` and its staged files.
+
+    The folder is display structure only. Removing it drops every staged file
+    underneath, those files' hash records, and the matching linked-folder sync
+    keys. It does not delete the user's original files in a linked source.
     """
     raw_dir = kb_dir / "raw"
-    hash_key = _raw_hash_key(file_path, raw_dir)
-
-    target = file_path.resolve()
-    if target.exists():
-        target.unlink()
-
-    metadata_file = kb_dir / "metadata.json"
-    metadata = _read_metadata(metadata_file)
-    hashes = metadata.get("file_hashes")
-    was_indexed = isinstance(hashes, dict) and hash_key in hashes
-    if was_indexed:
-        del hashes[hash_key]
-        _write_metadata(metadata_file, metadata)
-
-    return RawDocumentRemoval(rel_path=hash_key, was_indexed=was_indexed)
+    if folder.is_symlink():
+        raise ValueError(f"Refusing to follow symlink folder {folder}")
+    rel_folder = folder.resolve().relative_to(raw_dir.resolve()).as_posix()
+    if not rel_folder or rel_folder == ".":
+        raise ValueError("Refusing to delete the raw directory")
+    files = [
+        path
+        for path in folder.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    ]
+    removals = remove_raw_documents(kb_dir, files, directory_prefixes={rel_folder})
+    if folder.exists():
+        _discard_raw_directory(raw_dir, folder)
+    return RawTreeRemoval(
+        rel_path=rel_folder,
+        removed_files=tuple(item.rel_path for item in removals),
+        was_indexed=any(item.was_indexed for item in removals),
+    )
 
 
 class DocumentAdder:

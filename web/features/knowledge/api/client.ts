@@ -1408,10 +1408,10 @@ export async function moveKbFile(
 }
 
 /**
- * Delete a single raw document from a KB. Works even while the KB is in an
- * error state, so an unparseable file can be dropped without rebuilding the
- * whole base. `was_indexed` signals whether a re-index is needed to purge the
- * file's vectors from retrieval.
+ * Delete a raw document, or a folder and every file under it, from a KB.
+ * Works even while the KB is in an error state, so an unparseable file can be
+ * dropped without rebuilding the whole base. Linked-folder copies are removed
+ * from the knowledge base only; the original source files stay where they are.
  */
 export async function deleteKbFile(
   name: string,
