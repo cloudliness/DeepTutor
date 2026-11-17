@@ -46,6 +46,7 @@ from deeptutor.knowledge.add_documents import (
     DocumentAdder,
     hashes_for_indexed_files,
     remove_raw_document,
+    remove_raw_tree,
 )
 from deeptutor.knowledge.initializer import KnowledgeBaseInitializer
 from deeptutor.knowledge.kb_types import is_connected_kb, supports_local_raw_files
@@ -1228,6 +1229,25 @@ async def run_upload_processing_task(
                 rag_provider=rag_provider,
                 accepted_indexing_snapshot=accepted_indexing_snapshot,
             )
+
+            # A linked-folder sync can re-import sources whose staged copies
+            # were deleted earlier. Drop chunks that no longer have a file
+            # under raw/ before those copies are staged again, so the re-import
+            # does not sit beside the old vectors. An empty raw/ clears the
+            # active index.
+            if folder_id and (rag_provider or DEFAULT_PROVIDER) == DEFAULT_PROVIDER:
+                from deeptutor.knowledge.add_documents import raw_document_rels
+                from deeptutor.services.rag.factory import get_pipeline
+
+                retained = sorted(raw_document_rels(Path(base_dir) / kb_name / "raw"))
+                removed_nodes = await get_pipeline(
+                    DEFAULT_PROVIDER, kb_base_dir=str(base_dir)
+                ).retain_raw_files(kb_name, retained)
+                if removed_nodes:
+                    _task_log(
+                        task_id,
+                        f"Removed {removed_nodes} indexed node(s) whose files are no longer in raw/",
+                    )
 
             # Staging blocks: a full-content hash per file, plus a copy for
             # anything not already under raw/. A BackgroundTasks entry declared
@@ -3069,8 +3089,12 @@ def _resolve_kb_raw_dir(kb_name: str, *, allow_unsupported: bool = False) -> Pat
     return kb_path / "raw"
 
 
-def _resolve_raw_file_or_404(raw_dir: Path, filename: str) -> Path:
-    """Resolve a raw KB file within ``raw_dir`` while preventing traversal outside it."""
+def _resolve_raw_entry(raw_dir: Path, filename: str) -> Path:
+    """Resolve ``filename`` inside ``raw_dir``, rejecting traversal.
+
+    The returned path is resolved, so a symlink that points outside ``raw/``
+    is rejected instead of being followed into the user's source folder.
+    """
     if not raw_dir.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
@@ -3080,10 +3104,24 @@ def _resolve_raw_file_or_404(raw_dir: Path, filename: str) -> Path:
         target.relative_to(raw_resolved)
     except ValueError:
         raise HTTPException(status_code=403, detail="Access denied")
+    if target == raw_resolved:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return target
 
+
+def _resolve_raw_file_or_404(raw_dir: Path, filename: str) -> Path:
+    """Resolve a raw KB file within ``raw_dir`` while preventing traversal outside it."""
+    target = _resolve_raw_entry(raw_dir, filename)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
+    return target
 
+
+def _resolve_raw_entry_or_404(raw_dir: Path, filename: str) -> Path:
+    """Resolve a raw file or organizational folder inside ``raw_dir``."""
+    target = _resolve_raw_entry(raw_dir, filename)
+    if not target.exists() or not (target.is_file() or target.is_dir()):
+        raise HTTPException(status_code=404, detail="File not found")
     return target
 
 
@@ -3312,16 +3350,80 @@ async def kb_source_page(
     )
 
 
+async def _purge_indexed_sources(
+    manager: KnowledgeBaseManager,
+    kb_name: str,
+    provider: str,
+    relative_paths: list[str],
+    *,
+    directory_prefixes: list[str] | None = None,
+) -> None:
+    """Remove ``relative_paths`` from the provider index before the raw copies go.
+
+    LlamaIndex republishes the active version without those chunks. PageIndex
+    deletes the remote or local document record. A KB with no ready index is
+    left alone so an error-state base can still drop an unparseable file.
+    """
+    if provider == DEFAULT_PROVIDER:
+        from deeptutor.knowledge.add_documents import raw_document_rels
+        from deeptutor.services.rag.factory import get_pipeline
+        from deeptutor.services.rag.pipelines.llamaindex.pipeline import IndexingStallError
+
+        # The index lives next to this KB's raw files. Pass that directory's
+        # parent explicitly so a workspace manager cannot rewrite a different
+        # copy than the one the route is about to unlink.
+        kb_dir = manager.get_knowledge_base_path(kb_name)
+        retained = raw_document_rels(kb_dir / "raw")
+        removed = {path.strip("/") for path in relative_paths if path}
+        prefixes = {path.strip("/") for path in (directory_prefixes or []) if path}
+        for rel in list(retained):
+            if rel in removed or any(rel == prefix or rel.startswith(prefix + "/") for prefix in prefixes):
+                retained.discard(rel)
+        try:
+            removed_nodes = await get_pipeline(
+                provider, kb_base_dir=str(kb_dir.parent)
+            ).retain_raw_files(kb_name, sorted(retained))
+        except IndexingStallError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if removed_nodes:
+            logger.info(
+                "KB '%s' delete republished the LlamaIndex without %s node(s)",
+                kb_name,
+                removed_nodes,
+            )
+        return
+    if provider in {PAGEINDEX_PROVIDER, PAGEINDEX_OSS_PROVIDER}:
+        from deeptutor.services.rag.factory import get_pipeline
+
+        pipeline = get_pipeline(provider, kb_base_dir=str(manager.base_dir))
+        for relative in relative_paths:
+            await pipeline.remove_document(kb_name, Path(relative).name)
+
+
+def _raw_files_under(raw_dir: Path, folder: Path) -> list[str]:
+    """POSIX paths of real files under ``folder``, skipping symlinks."""
+    paths: list[str] = []
+    for path in folder.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        paths.append(path.relative_to(raw_dir.resolve()).as_posix())
+    return paths
+
+
 @router.delete("/knowledge-bases/{kb_name}/files/{filename:path}")
 async def delete_kb_file(kb_name: str, filename: str):
-    """Remove a single raw document from a knowledge base.
+    """Remove a raw document, or an organizational folder, from a knowledge base.
 
     Unlike deleting the whole KB, this works while the KB is in an *error*
     state — that is the point: a file that failed to parse (e.g. one that
     exceeds the cloud parser's page limit) can be dropped without deleting and
     rebuilding everything. Connected (read-only) and legacy KBs are still
-    rejected. Vectors are not pruned here; ``was_indexed`` tells the caller
-    whether a re-index is needed to purge the file from retrieval.
+    rejected.
+
+    A folder path removes that folder, every staged file under it, and those
+    files' chunks from the active index. Linked-folder sync state forgets the
+    removed paths, so the next sync imports them again. The user's original
+    files in a linked source folder are never deleted.
     """
     manager, resolved_name, _ = _writable_kb(kb_name)
     kb_entry = _load_kb_entry_or_404(manager, resolved_name)
@@ -3329,17 +3431,35 @@ async def delete_kb_file(kb_name: str, filename: str):
 
     kb_dir = manager.get_knowledge_base_path(resolved_name)
     raw_dir = kb_dir / "raw"
-    target = _resolve_raw_file_or_404(raw_dir, filename)
-
+    target = _resolve_raw_entry_or_404(raw_dir, filename)
     provider = _validate_registered_provider(kb_entry.get("rag_provider") or DEFAULT_PROVIDER)
-    if provider in {PAGEINDEX_PROVIDER, PAGEINDEX_OSS_PROVIDER}:
-        from deeptutor.services.rag.factory import get_pipeline
+    relative = target.relative_to(raw_dir.resolve()).as_posix()
 
-        await get_pipeline(provider, kb_base_dir=str(manager.base_dir)).remove_document(
+    if target.is_dir():
+        relative_paths = _raw_files_under(raw_dir, target)
+        await _purge_indexed_sources(
+            manager,
             resolved_name,
-            target.name,
+            provider,
+            relative_paths,
+            directory_prefixes=[relative],
         )
-    VisualAssetStore(kb_dir).remove_source(target.relative_to(raw_dir).as_posix())
+        for path in relative_paths:
+            VisualAssetStore(kb_dir).remove_source(path)
+        try:
+            removal = remove_raw_tree(Path(kb_dir), target)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "status": "ok",
+            "path": removal.rel_path,
+            "type": "folder",
+            "removed_files": list(removal.removed_files),
+            "was_indexed": removal.was_indexed,
+        }
+
+    await _purge_indexed_sources(manager, resolved_name, provider, [relative])
+    VisualAssetStore(kb_dir).remove_source(relative)
     removal = remove_raw_document(Path(kb_dir), target)
     return {
         "status": "ok",

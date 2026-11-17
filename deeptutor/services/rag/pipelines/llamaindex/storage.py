@@ -625,6 +625,341 @@ def retrieve_nodes(
     return retrievers.retrieve_scoped_nodes(index, query, document_keys, top_k=top_k)
 
 
+def _node_source_keys(node: Any, raw_dir: Path) -> set[str]:
+    """Paths a stored node claims as its source.
+
+    Indexed chunks often keep the absolute path they were parsed from. That
+    path is the staged file under ``raw/`` for a current sync, and the linked
+    source path for documents indexed before the copy was the thing we stored.
+    Both shapes have to be recognizable, so the absolute string is kept even
+    when it does not resolve under today's ``raw/``.
+    """
+    metadata = getattr(node, "metadata", None)
+    if not isinstance(metadata, dict):
+        return set()
+    keys: set[str] = set()
+    document_key = metadata.get("document_key")
+    if isinstance(document_key, str) and document_key.strip():
+        keys.add(document_key.replace("\\", "/").lstrip("/"))
+    file_path = metadata.get("file_path")
+    if isinstance(file_path, str) and file_path.strip():
+        keys.add(file_path.replace("\\", "/"))
+        path = Path(file_path)
+        if path.is_absolute():
+            try:
+                keys.add(path.resolve().relative_to(raw_dir.resolve()).as_posix())
+            except (OSError, ValueError):
+                pass
+        else:
+            keys.add(path.as_posix().lstrip("./"))
+    file_name = metadata.get("file_name")
+    if isinstance(file_name, str) and file_name.strip() and "/" not in file_name.replace("\\", "/"):
+        keys.add(file_name.replace("\\", "/"))
+    return keys
+
+
+def _source_selected(keys: set[str], files: set[str], prefixes: set[str]) -> bool:
+    """True when a node key names one of ``files`` or sits under a prefix.
+
+    Absolute source paths match by suffix (``.../01-Basic/a.pdf`` matches the
+    raw-relative ``01-Basic/a.pdf``). A bare filename matches the same filename
+    at the end of a raw-relative path, which is all older chunks stored.
+    """
+    retained = {item.strip("/") for item in files if item and item.strip("/")}
+    folder_prefixes = {item.strip("/") for item in prefixes if item and item.strip("/")}
+    for key in keys:
+        norm = key.replace("\\", "/").lstrip("./")
+        if not norm:
+            continue
+        if norm in retained:
+            return True
+        for rel in retained:
+            if norm.endswith("/" + rel):
+                return True
+            if "/" not in norm and norm == rel.rsplit("/", 1)[-1]:
+                return True
+        for prefix in folder_prefixes:
+            if norm == prefix or norm.endswith("/" + prefix) or f"/{prefix}/" in f"/{norm}/":
+                return True
+    return False
+
+
+def _stored_embeddings(index: Any) -> dict[str, list[float]]:
+    """Reuse vectors already stored on the active index.
+
+    FAISS has no delete operation, and the docstore strips embeddings to avoid
+    storing them twice. Reconstruction is what lets a deletion republish the
+    remaining chunks without calling the embedding provider.
+    """
+    documents = getattr(getattr(index, "docstore", None), "docs", None) or {}
+    store = getattr(index, "vector_store", None)
+    data = getattr(getattr(store, "data", None), "embedding_dict", None)
+    if isinstance(data, dict) and data:
+        return {str(node_id): list(vector) for node_id, vector in data.items()}
+    faiss_index = getattr(store, "_faiss_index", None)
+    nodes_dict = getattr(getattr(index, "index_struct", None), "nodes_dict", None)
+    if faiss_index is not None and isinstance(nodes_dict, dict):
+        found: dict[str, list[float]] = {}
+        for vector_id, node_id in nodes_dict.items():
+            if node_id not in documents:
+                continue
+            found[str(node_id)] = faiss_index.reconstruct(int(vector_id)).tolist()
+        return found
+    found = {}
+    for node in documents.values():
+        embedding = getattr(node, "embedding", None)
+        if embedding:
+            found[str(node.node_id)] = list(embedding)
+    return found
+
+
+def _stored_only_embedding() -> Any:
+    """An embedder that only accepts an empty batch.
+
+    LlamaIndex asks for embeddings even when every node already has one, and
+    that call is an empty list. Anything else means a vector was lost and the
+    deletion must stop instead of inventing a new embedding.
+    """
+    from llama_index.core.embeddings import BaseEmbedding
+
+    class _StoredVectorEmbedding(BaseEmbedding):
+        def get_text_embedding_batch(self, texts: list[str], **kwargs: Any) -> list[list[float]]:
+            if not texts:
+                return []
+            raise RuntimeError(
+                "Removing a document reuses stored vectors and does not call "
+                "the embedding provider."
+            )
+
+        def _get_text_embedding(self, text: str) -> list[float]:
+            raise RuntimeError("document removal does not embed")
+
+        def _get_query_embedding(self, query: str) -> list[float]:
+            raise RuntimeError("document removal does not embed")
+
+        async def _aget_text_embedding(self, text: str) -> list[float]:
+            raise RuntimeError("document removal does not embed")
+
+        async def _aget_query_embedding(self, query: str) -> list[float]:
+            raise RuntimeError("document removal does not embed")
+
+    return _StoredVectorEmbedding()
+
+
+def _publish_kept_index(nodes: list[Any], storage_dir: Path) -> None:
+    """Persist ``nodes`` as a new index, refusing to embed anything."""
+    from llama_index.core import VectorStoreIndex
+
+    kwargs: dict[str, Any] = {
+        "nodes": nodes,
+        "embed_model": _stored_only_embedding(),
+        "show_progress": False,
+    }
+    if nodes:
+        context = vector_store.storage_context_for_nodes(nodes)
+        if context is not None:
+            kwargs["storage_context"] = context
+    rebuilt = VectorStoreIndex(**kwargs)
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    rebuilt.storage_context.persist(persist_dir=str(storage_dir))
+    if not nodes:
+        # An empty VectorStoreIndex persists ``{}``. The readiness probe only
+        # counts ``docstore/data``, so write that key or the active version
+        # reports no document count instead of zero.
+        atomic_write_json(
+            storage_dir / "docstore.json",
+            {"docstore/data": {}, "docstore/metadata": {}},
+        )
+    retrievers.persist_bm25_retriever(rebuilt, storage_dir, top_k=20)
+
+
+def _carry_page_catalog(
+    source_dir: Path,
+    dest_dir: Path,
+    files: set[str],
+    prefixes: set[str],
+    *,
+    keep: set[str] | None = None,
+) -> None:
+    catalog = source_dir / "source_pages.json"
+    if not catalog.is_file():
+        return
+    try:
+        payload = json.loads(catalog.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(payload, dict):
+        return
+    pages = payload.get("pages")
+    if not isinstance(pages, list):
+        return
+    kept_pages = []
+    for page in pages:
+        key = page.get("document_key") if isinstance(page, dict) else None
+        keys = {key.replace("\\", "/")} if isinstance(key, str) else set()
+        if keep is not None:
+            if keep and _source_selected(keys, keep, set()):
+                kept_pages.append(page)
+            continue
+        if keys and _source_selected(keys, files, prefixes):
+            continue
+        kept_pages.append(page)
+    payload["pages"] = kept_pages
+    atomic_write_json(dest_dir / "source_pages.json", payload)
+
+
+def _publish_deletion_meta(source_dir: Path, dest_dir: Path) -> None:
+    """Copy the active version's identity onto the rewritten index."""
+    from datetime import datetime, timezone
+
+    meta: dict[str, Any] = {}
+    meta_path = source_dir / "meta.json"
+    if meta_path.is_file():
+        try:
+            loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            meta = loaded
+    for stale in ("storage_path", "version_path", "ready", "failure_summary"):
+        meta.pop(stale, None)
+    meta["version"] = dest_dir.name
+    meta["provider"] = meta.get("provider") or "llamaindex"
+    meta["layout"] = "flat"
+    meta["created_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+    meta["state"] = "published"
+    meta["readiness_verified"] = True
+    atomic_write_json(dest_dir / "meta.json", meta)
+
+
+def _node_drops(
+    node: Any,
+    raw_dir: Path,
+    *,
+    files: set[str],
+    prefixes: set[str],
+    retained: set[str] | None,
+) -> bool:
+    """Return whether ``node`` should leave the active index."""
+    if retained is not None:
+        # An empty raw directory means nothing in the index is still a document.
+        if not retained:
+            return True
+        keys = _node_source_keys(node, raw_dir)
+        if not keys:
+            return False
+        return not _source_selected(keys, retained, set())
+    return _source_selected(_node_source_keys(node, raw_dir), files, prefixes)
+
+
+def _rewrite_active_index(
+    kb_dir: Path,
+    *,
+    files: set[str],
+    prefixes: set[str],
+    retained: set[str] | None,
+) -> int:
+    """Republish the active index without the nodes selected for removal.
+
+    FAISS cannot delete vectors in place, so survivors are rebuilt into the
+    next version from embeddings already on disk. The new version becomes the
+    one readers open; older versions stay as history. Returns how many nodes
+    were dropped. No ready index, or a selection that matches nothing, writes
+    nothing.
+    """
+    storage_dir = resolve_storage_dir_for_read(kb_dir, None)
+    if storage_dir is None or not (storage_dir / "docstore.json").is_file():
+        return 0
+
+    index = vector_store.load_index(storage_dir, embed_model=_stored_only_embedding())
+    documents = getattr(getattr(index, "docstore", None), "docs", None) or {}
+    embeddings = _stored_embeddings(index)
+    nodes_dict = getattr(getattr(index, "index_struct", None), "nodes_dict", None) or {}
+    vector_node_ids = {str(node_id) for node_id in nodes_dict.values()}
+    vector_node_ids.update(embeddings)
+    raw_dir = kb_dir / "raw"
+    kept: list[Any] = []
+    removed = 0
+    missing_vectors: list[str] = []
+    for node in documents.values():
+        selected = _node_drops(node, raw_dir, files=files, prefixes=prefixes, retained=retained)
+        node_id = str(getattr(node, "node_id", ""))
+        is_vector = node_id in vector_node_ids
+        if not is_vector:
+            if selected:
+                removed += 1
+            continue
+        if node_id not in embeddings:
+            if not selected:
+                missing_vectors.append(node_id)
+            else:
+                removed += 1
+            continue
+        if selected:
+            removed += 1
+            continue
+        copy = node.model_copy(deep=True)
+        copy.embedding = embeddings[node_id]
+        kept.append(copy)
+    if missing_vectors:
+        raise ValueError(
+            "Stored vectors are missing for "
+            f"{len(missing_vectors)} remaining node(s); the active index was left unchanged."
+        )
+    if removed == 0:
+        return 0
+
+    new_dir = resolve_storage_dir_for_rebuild(kb_dir, None, publication_guard=True)
+    try:
+        _publish_kept_index(kept, new_dir)
+        if retained is None:
+            _carry_page_catalog(storage_dir, new_dir, files, prefixes)
+        else:
+            _carry_page_catalog(storage_dir, new_dir, set(), set(), keep=retained)
+        _publish_deletion_meta(storage_dir, new_dir)
+    except Exception:
+        shutil.rmtree(new_dir, ignore_errors=True)
+        raise
+    clear_index_cache()
+    return removed
+
+
+def drop_sources_from_active_index(
+    kb_dir: Path,
+    relative_paths: set[str],
+    *,
+    directory_prefixes: set[str] | None = None,
+) -> int:
+    """Republish the active LlamaIndex without chunks from ``relative_paths``.
+
+    Returns how many vector nodes were dropped. A knowledge base with no ready
+    index is unchanged (an error-state KB can still delete its raw files).
+    When nothing in the active index matches, no new version is written.
+    """
+    files = {path.strip("/") for path in relative_paths if path and path.strip("/")}
+    prefixes = {
+        prefix.strip("/")
+        for prefix in (directory_prefixes or set())
+        if prefix and prefix.strip("/")
+    }
+    if not files and not prefixes:
+        return 0
+    return _rewrite_active_index(kb_dir, files=files, prefixes=prefixes, retained=None)
+
+
+def republish_index_for_raw_files(kb_dir: Path, retained: set[str]) -> int:
+    """Make the active index describe exactly the files still under ``raw/``.
+
+    ``retained`` is the set of raw-relative paths that will still exist after
+    this deletion (or that exist right now, when a sync is about to re-import
+    missing copies). An empty set publishes an empty index, which is required
+    when the last document is removed: chunks whose stored path is the linked
+    source, not the staged copy, would otherwise survive a path comparison.
+    """
+    kept = {path.strip("/") for path in retained if path and path.strip("/")}
+    return _rewrite_active_index(kb_dir, files=set(), prefixes=set(), retained=kept)
+
+
 def delete_kb_dir(kb_dir: Path) -> bool:
     if kb_dir.exists():
         shutil.rmtree(kb_dir)

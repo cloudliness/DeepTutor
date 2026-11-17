@@ -1,7 +1,17 @@
 "use client";
 
 import Tooltip from "@/shared/ui/Tooltip";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { browserStorage } from "@/shared/storage";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { useTranslation } from "react-i18next";
 import {
   Check,
@@ -43,6 +53,147 @@ interface TreeNode {
   type: "file" | "folder";
   file?: KnowledgeBaseFile;
   children: TreeNode[];
+}
+
+const TREE_WIDTH_KEY = "kb-files:tree-width";
+const TREE_MIN = 160;
+const TREE_MAX = 560;
+const TREE_DEFAULT = 220;
+
+function expandedStorageKey(kbName: string): string {
+  return `kb-files:${kbName}:expanded`;
+}
+
+function readExpandedFolders(kbName: string): Set<string> {
+  try {
+    const raw = browserStorage.readRaw("local", expandedStorageKey(kbName));
+    if (raw == null) return new Set();
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((item): item is string => typeof item === "string"));
+  } catch {
+    return new Set();
+  }
+}
+
+function writeExpandedFolders(kbName: string, paths: Set<string>) {
+  try {
+    browserStorage.writeRaw(
+      "local",
+      expandedStorageKey(kbName),
+      JSON.stringify([...paths]),
+    );
+  } catch {
+    // quota / privacy mode; the tree still toggles for this visit
+  }
+}
+
+function clampTreeWidth(width: number, max: number): number {
+  return Math.round(Math.max(TREE_MIN, Math.min(max, width)));
+}
+
+function useFileTreeWidth(disabled: boolean) {
+  const [preferredWidth, setPreferredWidth] = useState(TREE_DEFAULT);
+  const [max, setMax] = useState(TREE_MAX);
+  const [resizing, setResizing] = useState(false);
+  const drag = useRef<{
+    pointerId: number;
+    startX: number;
+    startWidth: number;
+  } | null>(null);
+  const width = clampTreeWidth(preferredWidth, max);
+
+  useLayoutEffect(() => {
+    const stored = Number(browserStorage.readRaw("local", TREE_WIDTH_KEY));
+    if (Number.isFinite(stored) && stored > 0) {
+      // Hydrate after mount so SSR and the first client render match.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setPreferredWidth(clampTreeWidth(stored, TREE_MAX));
+    }
+    const updateBounds = () =>
+      setMax(
+        Math.max(
+          TREE_MIN,
+          Math.min(TREE_MAX, Math.floor(window.innerWidth * 0.6)),
+        ),
+      );
+    updateBounds();
+    window.addEventListener("resize", updateBounds);
+    return () => window.removeEventListener("resize", updateBounds);
+  }, []);
+
+  useEffect(() => {
+    if (!resizing || disabled) return;
+    const { cursor, userSelect } = document.body.style;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    return () => {
+      document.body.style.cursor = cursor;
+      document.body.style.userSelect = userSelect;
+    };
+  }, [resizing, disabled]);
+
+  const saveWidth = (next: number) => {
+    const bounded = clampTreeWidth(next, max);
+    setPreferredWidth(bounded);
+    try {
+      browserStorage.writeRaw("local", TREE_WIDTH_KEY, String(bounded));
+    } catch {
+      // ignore quota / privacy mode
+    }
+  };
+
+  const finishDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (drag.current?.pointerId !== event.pointerId) return;
+    drag.current = null;
+    setResizing(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  return {
+    width,
+    min: TREE_MIN,
+    max,
+    resizing,
+    handleProps: {
+      onPointerDown: (event: ReactPointerEvent<HTMLDivElement>) => {
+        if (disabled || event.button !== 0) return;
+        event.preventDefault();
+        event.currentTarget.focus();
+        event.currentTarget.setPointerCapture(event.pointerId);
+        drag.current = {
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startWidth: width,
+        };
+        setResizing(true);
+      },
+      onPointerMove: (event: ReactPointerEvent<HTMLDivElement>) => {
+        const current = drag.current;
+        if (disabled || !current || current.pointerId !== event.pointerId) return;
+        saveWidth(current.startWidth + event.clientX - current.startX);
+      },
+      onPointerUp: finishDrag,
+      onPointerCancel: finishDrag,
+      onLostPointerCapture: finishDrag,
+      onDoubleClick: () => saveWidth(TREE_DEFAULT),
+      onKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => {
+        if (disabled) return;
+        const step = event.shiftKey ? 40 : 16;
+        const next = {
+          ArrowLeft: width - step,
+          ArrowRight: width + step,
+          Home: TREE_MIN,
+          End: max,
+        }[event.key];
+        if (next === undefined) return;
+        event.preventDefault();
+        saveWidth(next);
+      },
+    },
+  };
 }
 
 function parentOf(path: string): string {
@@ -134,10 +285,6 @@ export default function KbDocumentList({
         if (force) invalidateClientCache(`knowledge:files:${kbName}`);
         const next = await listKnowledgeBaseFiles(kbName, { force });
         setFiles(next);
-        // Default-expand every folder so files are visible without digging.
-        setExpanded(
-          new Set(next.filter((e) => e.type === "folder").map((e) => e.name)),
-        );
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       } finally {
@@ -151,6 +298,13 @@ export default function KbDocumentList({
     void load(refreshKey > 0);
   }, [load, refreshKey]);
 
+  useLayoutEffect(() => {
+    // A KB with no saved state stays collapsed. Saved paths are restored when
+    // the user comes back from another tab or the sidebar.
+    setExpanded(readExpandedFolders(kbName));
+  }, [kbName]);
+
+  const treeWidth = useFileTreeWidth(collapsed);
   const { root, folderPaths } = useMemo(() => buildTree(files), [files]);
   const fileEntries = useMemo(
     () => files.filter((e) => e.type !== "folder"),
@@ -162,6 +316,7 @@ export default function KbDocumentList({
       const next = new Set(prev);
       if (next.has(path)) next.delete(path);
       else next.add(path);
+      writeExpandedFolders(kbName, next);
       return next;
     });
 
@@ -213,8 +368,14 @@ export default function KbDocumentList({
     setBusy(true);
     try {
       await deleteKbFile(kbName, path);
-      // Drop the preview if the deleted file was the one being shown.
-      if (selectedFile === path) onSelect(null);
+      // Drop the preview if it showed the deleted file or anything inside a
+      // deleted folder.
+      if (
+        selectedFile === path ||
+        (selectedFile?.startsWith(`${path}/`) ?? false)
+      ) {
+        onSelect(null);
+      }
       await load(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -273,7 +434,7 @@ export default function KbDocumentList({
       const open = expanded.has(node.path);
       const isDrop = dropTarget === node.path;
       return (
-        <li key={`d:${node.path}`}>
+        <li key={`d:${node.path}`} className="group/row relative">
           <div
             onClick={() => toggleFolder(node.path)}
             onDragOver={(e) => {
@@ -291,7 +452,7 @@ export default function KbDocumentList({
               if (src) void handleMove(src, node.path);
             }}
             style={indent}
-            className={`flex cursor-pointer items-center gap-1 rounded-md py-1.5 pr-2 text-left transition-colors ${
+            className={`flex cursor-pointer items-center gap-1 rounded-md py-1.5 pr-1 text-left transition-colors ${
               isDrop
                 ? "bg-[var(--primary)]/15 ring-1 ring-[var(--primary)]/40"
                 : "hover:bg-[var(--muted)]/50"
@@ -303,9 +464,60 @@ export default function KbDocumentList({
               <ChevronRight className="h-3 w-3 shrink-0 text-[var(--muted-foreground)]" />
             )}
             <Folder className="h-3.5 w-3.5 shrink-0 text-[var(--muted-foreground)]" />
-            <span className="truncate text-[12px] font-medium text-[var(--foreground)]">
+            <span
+              title={node.name}
+              className="min-w-0 flex-1 truncate text-[12px] font-medium text-[var(--foreground)]"
+            >
               {node.name}
             </span>
+            {confirmDeleteFor === node.path ? (
+              <div
+                className="flex shrink-0 items-center gap-0.5 pr-0.5"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <span className="px-0.5 text-[10px] font-medium text-red-600 dark:text-red-400">
+                  {t("Delete?")}
+                </span>
+                <Tooltip label={t("Confirm delete")} side="top">
+                  <button
+                    type="button"
+                    onClick={() => void handleDelete(node.path)}
+                    disabled={busy}
+                    aria-label={t("Confirm delete")}
+                    className="rounded p-1 text-red-600 transition-colors hover:bg-red-50 disabled:opacity-40 dark:text-red-400 dark:hover:bg-red-950/40"
+                  >
+                    <Check className="h-3.5 w-3.5" />
+                  </button>
+                </Tooltip>
+                <Tooltip label={t("Cancel")} side="top">
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDeleteFor(null)}
+                    aria-label={t("Cancel")}
+                    className="rounded p-1 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </Tooltip>
+              </div>
+            ) : (
+              <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover/row:opacity-100">
+                <Tooltip label={t("Delete folder")} side="top">
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setMoveMenuFor(null);
+                      setConfirmDeleteFor(node.path);
+                    }}
+                    aria-label={t("Delete folder")}
+                    className="rounded p-1 text-[var(--muted-foreground)] transition-colors hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/40 dark:hover:text-red-400"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </Tooltip>
+              </div>
+            )}
           </div>
           {open && node.children.length > 0 && (
             <ul className="space-y-px">
@@ -349,7 +561,10 @@ export default function KbDocumentList({
               className={`shrink-0 ${spec.tint}`}
             />
             <div className="min-w-0 flex-1">
-              <div className="truncate text-[12px] font-medium text-[var(--foreground)]">
+              <div
+                title={node.name}
+                className="truncate text-[12px] font-medium text-[var(--foreground)]"
+              >
                 {node.name}
               </div>
               <div className="truncate text-[10px] text-[var(--muted-foreground)]">
@@ -463,7 +678,10 @@ export default function KbDocumentList({
   };
 
   return (
-    <aside className="flex h-full w-[220px] shrink-0 flex-col border-r border-[var(--border)] bg-[var(--card)]/40">
+    <aside
+      style={{ width: treeWidth.width }}
+      className="relative flex h-full shrink-0 flex-col border-r border-[var(--border)] bg-[var(--card)]/40"
+    >
       <div className="flex items-center justify-between gap-1 px-2.5 pb-1.5 pt-2.5">
         <div className="flex min-w-0 items-center gap-1.5">
           <span className="text-[12px] font-medium text-[var(--foreground)]">
@@ -579,6 +797,21 @@ export default function KbDocumentList({
         ) : (
           <ul className="space-y-px">{root.map((n) => renderNode(n, 0))}</ul>
         )}
+      </div>
+      <div
+        role="separator"
+        aria-label={t("Resize file list")}
+        aria-orientation="vertical"
+        aria-valuemin={treeWidth.min}
+        aria-valuemax={treeWidth.max}
+        aria-valuenow={treeWidth.width}
+        tabIndex={0}
+        {...treeWidth.handleProps}
+        className="group/resize absolute inset-y-0 -right-1 z-30 w-2 touch-none cursor-col-resize outline-none"
+      >
+        <div
+          className={`mx-auto h-full w-0.5 transition-colors group-hover/resize:bg-[var(--ring)] group-focus-visible/resize:bg-[var(--ring)] ${treeWidth.resizing ? "bg-[var(--ring)]" : "bg-transparent"}`}
+        />
       </div>
     </aside>
   );

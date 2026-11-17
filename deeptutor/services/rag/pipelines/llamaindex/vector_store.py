@@ -246,15 +246,21 @@ def detect_backend(storage_dir: Path) -> str:
     return BACKEND_SIMPLE if head[:1] == b"{" else BACKEND_FAISS
 
 
-def load_index(storage_dir: Path) -> Any:
+def load_index(storage_dir: Path, embed_model: Any | None = None) -> Any:
     """Load a persisted index for retrieval.
 
     FAISS-persisted versions load their binary index directly. Legacy
     SimpleVectorStore versions load unchanged and stay queryable; re-indexing
     such a knowledge base rebuilds it as FAISS for the full speed-up.
+
+    ``embed_model`` overrides the process-wide adapter. Document removal passes
+    a model that refuses to embed, so loading an index never calls Ollama.
     """
     storage_dir = Path(storage_dir)
-    from .embedding_adapter import current_embedding
+    if embed_model is None:
+        from .embedding_adapter import current_embedding
+
+        embed_model = current_embedding()
 
     if detect_backend(storage_dir) == BACKEND_FAISS:
         cosine_cls = _cosine_faiss_cls()
@@ -268,10 +274,10 @@ def load_index(storage_dir: Path) -> Any:
         context = StorageContext.from_defaults(
             persist_dir=str(storage_dir), vector_store=vector_store
         )
-        return load_index_from_storage(context, embed_model=current_embedding())
+        return load_index_from_storage(context, embed_model=embed_model)
 
     context = StorageContext.from_defaults(persist_dir=str(storage_dir))
-    return load_index_from_storage(context, embed_model=current_embedding())
+    return load_index_from_storage(context, embed_model=embed_model)
 
 
 __all__ = [
