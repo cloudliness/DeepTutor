@@ -1093,6 +1093,8 @@
   "Select a file to preview": "Виберіть файл для перегляду",
   "Pick any document from the list on the left to view it here without leaving the knowledge base.": "Виберіть будь-який документ зі списку зліва, щоб переглянути його тут, не покидаючи базу знань.",
   "Collapse": "Згорнути",
+  "Collapse composer": "Згорнути поле введення",
+  "Expand composer": "Розгорнути поле введення",
   "Expand": "Розгорнути",
   "Show file list": "Показати список файлів",
   "Hide file list": "Приховати список файлів",

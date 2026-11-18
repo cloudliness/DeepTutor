@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { createRef } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { PlayAudioButton } from '@/components/voice/SpeechButton'
+import { speechSegments } from '@/lib/speech-segments'
 import SelectionActions from '@/features/chat/components/SelectionActions'
 import { SelectionSpeechToolbar } from '@/components/voice/SelectionSpeechToolbar'
 
@@ -158,6 +159,75 @@ describe('selected-text speech', () => {
     await waitFor(() => expect(mock.audio).toHaveLength(2))
     expect(mock.audio[0].pause).toHaveBeenCalled()
     await waitFor(() => expect(mock.audio[1].src).toBe('blob:speech'))
+  })
+
+  it('plays a long message in order and shows the backend error detail', async () => {
+    const content = [0, 1, 2, 3]
+      .map(index => `Paragraph ${index}. ${'word '.repeat(80)}`)
+      .join('\n\n')
+    const segments = speechSegments(content)
+    expect(segments.length).toBeGreaterThan(1)
+    let requests = 0
+    mock.fetch.mockImplementation(async () => {
+      requests += 1
+      if (requests < segments.length) {
+        return { ok: true, blob: async () => new Blob(['audio'], { type: 'audio/mpeg' }) }
+      }
+      return {
+        ok: false,
+        status: 400,
+        json: async () => ({ detail: [{ msg: 'Edge TTS rejected this passage.' }] }),
+      }
+    })
+    render(<PlayAudioButton content={content} autoPlayFresh={false} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Play aloud' }))
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      await waitFor(() => expect(mock.audio[0]?.src).toBe('blob:speech'))
+      await act(async () => mock.audio[0].onended?.())
+    }
+    await waitFor(() =>
+      expect(mock.notify).toHaveBeenCalledWith('Edge TTS rejected this passage.', { tone: 'error' })
+    )
+    const sent = mock.fetch.mock.calls.map(call => JSON.parse(call[1].body).text as string)
+    expect(sent.join('\n')).toContain('Paragraph 0')
+    expect(sent.join('\n')).toContain('Paragraph 3')
+    expect(screen.getByRole('button', { name: 'Play aloud' })).toBeVisible()
+  })
+
+  it('reports an object error detail and an HTTP status when the body is not JSON', async () => {
+    mock.fetch.mockResolvedValueOnce({
+      ok: false,
+      status: 502,
+      json: async () => ({ detail: { message: 'Edge TTS returned no audio for this passage.' } }),
+    })
+    const { unmount } = render(
+      <PlayAudioButton content="Provider object error." autoPlayFresh={false} />
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Play aloud' }))
+    await waitFor(() =>
+      expect(mock.notify).toHaveBeenCalledWith(
+        'Edge TTS returned no audio for this passage.',
+        { tone: 'error' }
+      )
+    )
+    unmount()
+    mock.notify.mockReset()
+    mock.fetch.mockResolvedValueOnce({
+      ok: false,
+      status: 504,
+      text: async () => '<!DOCTYPE html>gateway timeout',
+      json: async () => {
+        throw new SyntaxError('not json')
+      },
+    })
+    render(<PlayAudioButton content="Gateway timeout." autoPlayFresh={false} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Play aloud' }))
+    await waitFor(() =>
+      expect(mock.notify).toHaveBeenCalledWith(
+        expect.stringContaining('HTTP 504'),
+        { tone: 'error' }
+      )
+    )
   })
 
   it('reports provider errors instead of silently pretending to play', async () => {

@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next'
 import Tooltip from '@/shared/ui/Tooltip'
 import { apiFetch, apiUrl } from '@/lib/api'
 import { notify } from '@/lib/notifications'
+import { speechSegments } from '@/lib/speech-segments'
 import { useVoiceAutoplay } from '@/hooks/useVoiceAutoplay'
 import { SPEECH_PLAYBACK_FAILURE_MESSAGE, SPEECH_TIMEOUT_MESSAGE } from '@/lib/voice-settings'
 
@@ -14,18 +15,61 @@ import { SPEECH_PLAYBACK_FAILURE_MESSAGE, SPEECH_TIMEOUT_MESSAGE } from '@/lib/v
 let activePlayback: { owner: object; stop: () => void } | null = null
 // 50 ms of playable unsigned 8-bit PCM silence; an empty WAV cannot unlock playback.
 const SILENT_UNLOCK_WAV =
-  'data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA'
+  'data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA'
+
+function detailText(detail: unknown): string {
+  if (typeof detail === 'string') return detail.trim()
+  if (Array.isArray(detail)) {
+    return detail
+      .map(item => {
+        if (typeof item === 'string') return item.trim()
+        if (item && typeof item === 'object') {
+          const record = item as { msg?: unknown; message?: unknown }
+          if (typeof record.msg === 'string') return record.msg.trim()
+          if (typeof record.message === 'string') return record.message.trim()
+        }
+        return ''
+      })
+      .filter(Boolean)
+      .join(' ')
+  }
+  if (detail && typeof detail === 'object') {
+    const record = detail as { message?: unknown; msg?: unknown }
+    if (typeof record.message === 'string' && record.message.trim()) return record.message.trim()
+    if (typeof record.msg === 'string' && record.msg.trim()) return record.msg.trim()
+  }
+  return ''
+}
 
 async function ttsErrorMessage(resp: Response): Promise<string> {
-  try {
-    const body = (await resp.json()) as { detail?: unknown }
-    if (typeof body.detail === 'string' && body.detail.trim()) return body.detail
-    if (Array.isArray(body.detail)) {
-      const first = body.detail[0] as { msg?: string } | undefined
-      if (typeof first?.msg === 'string' && first.msg.trim()) return first.msg
+  const readable = resp as Response & {
+    text?: () => Promise<string>
+    json?: () => Promise<unknown>
+  }
+  // Real responses expose text(). Tests often stub json() only, so try that
+  // when there is no text body to read.
+  if (typeof readable.text === 'function') {
+    try {
+      const raw = (await readable.text()).trim()
+      if (!raw) return ''
+      try {
+        const body = JSON.parse(raw) as { detail?: unknown; message?: unknown }
+        return detailText(body.detail) || detailText(body.message)
+      } catch {
+        if (raw.startsWith('<')) return ''
+        return raw.slice(0, 400)
+      }
+    } catch {
+      /* body already consumed, or the stub has no text() */
     }
-  } catch {
-    /* non-JSON error body */
+  }
+  if (typeof readable.json === 'function') {
+    try {
+      const body = (await readable.json()) as { detail?: unknown; message?: unknown }
+      return detailText(body?.detail) || detailText(body?.message)
+    } catch {
+      /* non-JSON error body */
+    }
   }
   return ''
 }
@@ -59,6 +103,7 @@ export function PlayAudioButton({
   const genRef = useRef(0)
   const autoPlayedRef = useRef(false)
   const playbackOwnerRef = useRef<object>({})
+  const cancelWaitRef = useRef<(() => void) | null>(null)
 
   const cleanup = useCallback(() => {
     abortRef.current?.abort()
@@ -75,6 +120,8 @@ export function PlayAudioButton({
 
   const stop = useCallback(() => {
     genRef.current += 1
+    cancelWaitRef.current?.()
+    cancelWaitRef.current = null
     cleanup()
     setState('idle')
     if (activePlayback?.owner === playbackOwnerRef.current) activePlayback = null
@@ -89,6 +136,13 @@ export function PlayAudioButton({
     activePlayback = { owner: playbackOwnerRef.current, stop }
     setState('loading')
 
+    const segments = speechSegments(content)
+    if (!segments.length) {
+      notify(t(SPEECH_PLAYBACK_FAILURE_MESSAGE), { tone: 'error' })
+      stop()
+      return
+    }
+
     // WebKit evaluates media playback eligibility when play() is called. Keep
     // this element unlocked in the click task, then replace its source after
     // synthesis completes rather than constructing a new audio element then.
@@ -98,66 +152,84 @@ export function PlayAudioButton({
       /* Unlocking playback can fail on clients that already permit it. */
     })
 
-    try {
-      // Let the active provider apply the user's configured voice, format and
-      // language. Provider-specific voice IDs are not portable across services.
-      const resp = await apiFetch(apiUrl('/api/voice/tts'), {
+    const fetchSegment = (segment: string) => {
+      const pending = apiFetch(apiUrl('/api/voice/tts'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: content }),
+        body: JSON.stringify({ text: segment }),
         signal: ac.signal,
       })
-      if (gen !== genRef.current) return
-      if (!resp.ok) {
-        const detail = await ttsErrorMessage(resp)
+      // A segment prefetched for the next paragraph is abandoned when playback
+      // stops. Swallow that rejection so it does not surface as unhandled.
+      pending.catch(() => undefined)
+      return pending
+    }
+
+    const failure = (status: number) =>
+      t(status === 504 ? SPEECH_TIMEOUT_MESSAGE : SPEECH_PLAYBACK_FAILURE_MESSAGE) +
+      ` (HTTP ${status})`
+
+    try {
+      let upcoming: Promise<Response> | null = fetchSegment(segments[0])
+      for (let index = 0; index < segments.length; index += 1) {
         if (gen !== genRef.current) return
-        notify(
-          t(
-            detail ||
-              (resp.status === 504 ? SPEECH_TIMEOUT_MESSAGE : SPEECH_PLAYBACK_FAILURE_MESSAGE)
-          ),
-          { tone: 'error' }
-        )
-        stop()
-        return
-      }
-      const blob = await resp.blob()
-      if (!blob.size) throw new Error('Speech returned empty audio')
-      if (gen !== genRef.current) return
-      if (urlRef.current) {
-        URL.revokeObjectURL(urlRef.current)
-        urlRef.current = null
-      }
-      const url = URL.createObjectURL(blob)
-      urlRef.current = url
-      audio.src = url
-      audio.load()
-      audio.playbackRate = rateRef.current
-      audio.onended = () => {
+        const resp = await upcoming
+        upcoming =
+          index + 1 < segments.length ? fetchSegment(segments[index + 1]) : null
         if (gen !== genRef.current) return
-        setState('idle')
-        cleanup()
-        if (activePlayback?.owner === playbackOwnerRef.current) activePlayback = null
-      }
-      audio.onerror = () => {
+        if (!resp.ok) {
+          const detail = await ttsErrorMessage(resp)
+          if (gen !== genRef.current) return
+          notify(detail || failure(resp.status), { tone: 'error' })
+          stop()
+          return
+        }
+        const blob = await resp.blob()
+        if (!blob.size) throw new Error('Speech returned empty audio')
         if (gen !== genRef.current) return
-        notify(t(SPEECH_PLAYBACK_FAILURE_MESSAGE), {
-          tone: 'error',
+        const previous = urlRef.current
+        const url = URL.createObjectURL(blob)
+        urlRef.current = url
+        if (previous) URL.revokeObjectURL(previous)
+        const last = index === segments.length - 1
+        audio.src = url
+        audio.load()
+        audio.playbackRate = rateRef.current
+        const ended = new Promise<void>(resolve => {
+          cancelWaitRef.current = resolve
+          audio.onended = () => {
+            if (gen === genRef.current && last) {
+              setState('idle')
+              cleanup()
+              if (activePlayback?.owner === playbackOwnerRef.current) activePlayback = null
+            }
+            resolve()
+          }
+          audio.onerror = () => {
+            if (gen === genRef.current) {
+              notify(t(SPEECH_PLAYBACK_FAILURE_MESSAGE), { tone: 'error' })
+              stop()
+            }
+            resolve()
+          }
         })
-        stop()
+        await audio.play()
+        if (gen !== genRef.current) {
+          audio.pause()
+          return
+        }
+        setState('playing')
+        await ended
+        if (gen !== genRef.current) return
       }
-      await audio.play()
-      if (gen !== genRef.current) {
-        audio.pause()
-        return
-      }
-      setState('playing')
     } catch (err) {
       if (gen !== genRef.current) return
       if (err instanceof Error && err.name === 'AbortError') return
-      notify(t(SPEECH_PLAYBACK_FAILURE_MESSAGE), {
-        tone: 'error',
-      })
+      const message = err instanceof Error ? err.message.trim() : ''
+      notify(
+        message && !/^failed to fetch$/i.test(message) ? message : t(SPEECH_PLAYBACK_FAILURE_MESSAGE),
+        { tone: 'error' }
+      )
       stop()
     }
   }, [cleanup, content, stop, t])
@@ -183,6 +255,7 @@ export function PlayAudioButton({
   useEffect(
     () => () => {
       genRef.current += 1
+      cancelWaitRef.current?.()
       cleanup()
       if (activePlayback?.owner === playbackOwnerRef.current) activePlayback = null
     },

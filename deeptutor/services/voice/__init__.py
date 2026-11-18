@@ -8,16 +8,27 @@ Settings catalog UI.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from deeptutor.services.voice.adapters import get_stt_adapter, get_tts_adapter
+from deeptutor.services.voice.audio import concat_speech_audio
 from deeptutor.services.voice.base import (
+    BaseTTSAdapter,
     TranscriptCue,
     VoiceProviderError,
     strip_markdown_for_speech,
     synthesize_with_timeout,
 )
 from deeptutor.services.voice.config import STTConfig, TTSConfig
+from deeptutor.services.voice.speech_chunks import (
+    chunk_limit,
+    chunk_speech_text,
+    halve_speech_text,
+    soften_for_speech,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _math_speak_from_settings() -> bool:
@@ -53,15 +64,71 @@ async def synthesize_speech(
     if response_format:
         config.response_format = response_format
     speak_math = _math_speak_from_settings() if math_speak is None else math_speak
+    # Do not truncate here. A cap used to drop the rest of a long answer, so
+    # read-aloud stopped after the first window. Pieces are synthesized below.
     prepared = (
-        strip_markdown_for_speech(text, max_chars=config.max_input_chars, math_speak=speak_math)
+        strip_markdown_for_speech(text, max_chars=0, math_speak=speak_math)
         if strip_markdown
         else text.strip()
     )
+    prepared = soften_for_speech(prepared)
     if not prepared:
         raise VoiceProviderError("Nothing to speak after cleaning the text.")
+    if config.adapter == "edge":
+        from deeptutor.services.voice.adapters.edge import edge_voice_for_text
+
+        # One voice for the whole passage, so a short later piece does not
+        # switch language halfway through.
+        config.voice = edge_voice_for_text(prepared, config.voice)
+    chunks = chunk_speech_text(
+        prepared,
+        max_chars=chunk_limit(config.max_input_chars, config.adapter),
+    )
+    if not chunks:
+        raise VoiceProviderError("Nothing to speak after cleaning the text.")
+    if len(chunks) > 1:
+        logger.debug(
+            "Synthesizing speech in %s chunks (%s characters)",
+            len(chunks),
+            len(prepared),
+        )
     adapter = get_tts_adapter(config.adapter)
-    return await synthesize_with_timeout(adapter, prepared, config)
+    parts: list[bytes] = []
+    content_type = "application/octet-stream"
+    for chunk in chunks:
+        audio, content_type = await _synthesize_piece(adapter, chunk, config)
+        parts.append(audio)
+    return concat_speech_audio(parts, content_type), content_type
+
+
+def _edge_returned_no_audio(exc: VoiceProviderError) -> bool:
+    return "no audio" in str(exc).lower()
+
+
+async def _synthesize_piece(
+    adapter: BaseTTSAdapter,
+    text: str,
+    config: TTSConfig,
+) -> tuple[bytes, str]:
+    """Synthesize one piece, splitting an Edge no-audio failure once."""
+    try:
+        audio, content_type = await synthesize_with_timeout(adapter, text, config)
+    except VoiceProviderError as exc:
+        if config.adapter != "edge" or not _edge_returned_no_audio(exc):
+            raise
+        left, right = halve_speech_text(text)
+        if not right:
+            raise
+        logger.debug("Edge returned no audio; retrying the passage in two shorter pieces")
+        first, content_type = await synthesize_with_timeout(adapter, left, config)
+        second, second_type = await synthesize_with_timeout(adapter, right, config)
+        if not first or not second:
+            raise VoiceProviderError("The speech provider returned no audio.") from exc
+        merged = concat_speech_audio([first, second], content_type or second_type)
+        return merged, content_type or second_type
+    if not audio:
+        raise VoiceProviderError("The speech provider returned no audio.")
+    return audio, content_type
 
 
 async def transcribe_audio(

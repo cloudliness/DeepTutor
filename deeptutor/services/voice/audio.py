@@ -104,6 +104,55 @@ def _parse_pcm_content_type(content_type: str) -> tuple[int, int] | None:
     return sample_rate, channels
 
 
+def concat_speech_audio(parts: list[bytes], content_type: str) -> bytes:
+    """Join same-format synthesis pieces into one clip browsers can play.
+
+    WAV headers describe a single data length, so they are rewritten. MP3 and
+    raw PCM from one voice are sequential frames and concatenate directly.
+    """
+    if not parts:
+        return b""
+    if len(parts) == 1:
+        return parts[0]
+    media = (content_type or "").split(";", 1)[0].strip().lower()
+    if media in {"audio/wav", "audio/x-wav", "audio/wave"}:
+        joined = _concat_wav(parts)
+        if joined is not None:
+            return joined
+    return b"".join(parts)
+
+
+def _concat_wav(parts: list[bytes]) -> bytes | None:
+    frames: list[bytes] = []
+    params: tuple[int, int, int, str] | None = None
+    for part in parts:
+        try:
+            with wave.open(io.BytesIO(part), "rb") as wav:
+                current = (
+                    wav.getnchannels(),
+                    wav.getsampwidth(),
+                    wav.getframerate(),
+                    wav.getcomptype(),
+                )
+                if params is None:
+                    params = current
+                elif current != params:
+                    return None
+                frames.append(wav.readframes(wav.getnframes()))
+        except (wave.Error, EOFError):
+            return None
+    if params is None:
+        return None
+    channels, width, rate, _comptype = params
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(width)
+        wav.setframerate(rate)
+        wav.writeframes(b"".join(frames))
+    return buffer.getvalue()
+
+
 def _pcm16_to_wav(audio: bytes, *, sample_rate: int, channels: int) -> bytes:
     """Wrap provider PCM16 bytes in a WAV container browsers can play."""
     buffer = io.BytesIO()

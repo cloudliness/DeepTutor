@@ -1114,6 +1114,8 @@
   "Select a file to preview": "Önizlemek için bir dosya seçin",
   "Pick any document from the list on the left to view it here without leaving the knowledge base.": "Bilgi bankasından ayrılmadan burada görüntülemek için soldaki listeden bir belge seçin.",
   "Collapse": "Daralt",
+  "Collapse composer": "Yazı alanını daralt",
+  "Expand composer": "Yazı alanını genişlet",
   "Expand": "Genişlet",
   "Show file list": "Dosya listesini göster",
   "Hide file list": "Dosya listesini gizle",

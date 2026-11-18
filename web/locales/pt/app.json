@@ -1113,6 +1113,8 @@
   "Select a file to preview": "Selecione um arquivo para visualizar",
   "Pick any document from the list on the left to view it here without leaving the knowledge base.": "Escolha qualquer documento na lista à esquerda para visualizá-lo aqui sem sair da base de conhecimento.",
   "Collapse": "Recolher",
+  "Collapse composer": "Recolher a caixa de mensagem",
+  "Expand composer": "Expandir a caixa de mensagem",
   "Expand": "Expandir",
   "Show file list": "Mostrar lista de arquivos",
   "Hide file list": "Ocultar lista de arquivos",
