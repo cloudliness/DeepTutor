@@ -172,7 +172,7 @@ export function PlayAudioButton({
     try {
       let upcoming: Promise<Response> | null = fetchSegment(segments[0])
       for (let index = 0; index < segments.length; index += 1) {
-        if (gen !== genRef.current) return
+        if (gen !== genRef.current || !upcoming) return
         const resp = await upcoming
         upcoming =
           index + 1 < segments.length ? fetchSegment(segments[index + 1]) : null
