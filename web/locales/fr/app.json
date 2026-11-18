@@ -1529,6 +1529,8 @@
   "Select a file to preview": "Sélectionnez un fichier à prévisualiser",
   "Pick any document from the list on the left to view it here without leaving the knowledge base.": "Choisissez un document dans la liste de gauche pour le consulter ici sans quitter la base de connaissances.",
   "Collapse": "Réduire",
+  "Collapse composer": "Réduire la zone de saisie",
+  "Expand composer": "Agrandir la zone de saisie",
   "Expand": "Développer",
   "Show file list": "Afficher la liste des fichiers",
   "Hide file list": "Masquer la liste des fichiers",

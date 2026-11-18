@@ -9,11 +9,33 @@ Package: https://github.com/rany2/edge-tts
 from __future__ import annotations
 
 import math
+import re
 
 from deeptutor.services.voice.base import BaseTTSAdapter, VoiceProviderError
 from deeptutor.services.voice.config import TTSConfig
 
 EDGE_DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
+EDGE_ENGLISH_VOICE = "en-US-AriaNeural"
+# Han, hiragana and katakana. Latin letters decide an English voice instead.
+_CJK_OR_KANA = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
+_LATIN = re.compile(r"[A-Za-z]")
+
+
+def edge_voice_for_text(text: str, configured: str | None) -> str:
+    """Use the configured voice, or one that matches the passage.
+
+    An empty catalog voice used to always speak with zh-CN-XiaoxiaoNeural,
+    including for English answers. Latin-majority text uses Aria; other text
+    keeps the Chinese default.
+    """
+    voice = (configured or "").strip()
+    if voice:
+        return voice
+    latin = len(_LATIN.findall(text or ""))
+    cjk = len(_CJK_OR_KANA.findall(text or ""))
+    if latin > cjk:
+        return EDGE_ENGLISH_VOICE
+    return EDGE_DEFAULT_VOICE
 
 
 def edge_rate(speed: float | None) -> str:
@@ -37,15 +59,27 @@ class EdgeTTSAdapter(BaseTTSAdapter):
             ) from exc
         if (config.response_format or "mp3") != "mp3":
             raise VoiceProviderError("Edge TTS only produces mp3 audio.")
-        communicate = edge_tts.Communicate(
-            text, config.voice or EDGE_DEFAULT_VOICE, rate=edge_rate(config.speed)
-        )
+        voice = edge_voice_for_text(text, config.voice)
+        rate = edge_rate(config.speed)
         audio = bytearray()
         try:
+            communicate = edge_tts.Communicate(text, voice, rate=rate)
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
                     audio += chunk["data"]
+        except VoiceProviderError:
+            raise
+        except ValueError as exc:
+            # edge-tts rejects some payloads while building the request, before
+            # any audio. That used to escape as HTTP 400 with a parser message.
+            message = str(exc).strip() or "Edge TTS rejected this text."
+            raise VoiceProviderError(message) from exc
         except Exception as exc:  # edge-tts raises its own and aiohttp errors
+            if type(exc).__name__ == "NoAudioReceived":
+                raise VoiceProviderError(
+                    "Edge TTS returned no audio for this passage. Try again, or choose a "
+                    "voice that matches the language, such as en-US-AriaNeural."
+                ) from exc
             raise VoiceProviderError(f"Edge TTS request failed: {type(exc).__name__}.") from exc
         if not audio:
             raise VoiceProviderError("Edge TTS returned no audio.")

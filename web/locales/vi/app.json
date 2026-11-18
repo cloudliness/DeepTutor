@@ -1113,6 +1113,8 @@
   "Select a file to preview": "Chọn một tệp để xem trước",
   "Pick any document from the list on the left to view it here without leaving the knowledge base.": "Chọn bất kỳ tài liệu nào trong danh sách bên trái để xem tại đây mà không cần rời khỏi cơ sở tri thức.",
   "Collapse": "Thu gọn",
+  "Collapse composer": "Thu gọn ô soạn",
+  "Expand composer": "Mở rộng ô soạn",
   "Expand": "Mở rộng",
   "Show file list": "Hiện danh sách tệp",
   "Hide file list": "Ẩn danh sách tệp",

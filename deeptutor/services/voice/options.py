@@ -176,7 +176,9 @@ def _tts_models(provider: str) -> tuple[list[dict], str]:
                 speed={"min": 0.5, "max": 2, "step": 0.05},
                 configuration_note=(
                     "Free Microsoft Edge read-aloud voices; no API key. Not an official API, "
-                    "so it may be rate limited. Voices look like zh-CN-XiaoxiaoNeural."
+                    "so it may be rate limited. Leave the voice empty to follow the text "
+                    "(English uses en-US-AriaNeural, Chinese uses zh-CN-XiaoxiaoNeural), "
+                    "or pick another voice such as en-US-AriaNeural."
                 ),
             )
         ], "https://github.com/rany2/edge-tts"

@@ -1358,6 +1358,8 @@
   "Select a file to preview": "请选择一个文件以预览",
   "Pick any document from the list on the left to view it here without leaving the knowledge base.": "从左侧列表选择任意文档，可在此处直接预览，无需离开知识库。",
   "Collapse": "收起",
+  "Collapse composer": "收起输入框",
+  "Expand composer": "展开输入框",
   "Expand": "展开",
   "Show file list": "显示文件列表",
   "Hide file list": "隐藏文件列表",

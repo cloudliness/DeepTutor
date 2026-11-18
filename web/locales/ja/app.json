@@ -1114,6 +1114,8 @@
   "Select a file to preview": "プレビューするファイルを選択",
   "Pick any document from the list on the left to view it here without leaving the knowledge base.": "左のリストからドキュメントを選ぶと、ナレッジベースを離れずにここで表示できます。",
   "Collapse": "折りたたむ",
+  "Collapse composer": "入力欄を折りたたむ",
+  "Expand composer": "入力欄を展開",
   "Expand": "展開",
   "Show file list": "ファイル一覧を表示",
   "Hide file list": "ファイル一覧を非表示",

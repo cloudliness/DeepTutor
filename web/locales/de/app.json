@@ -1132,6 +1132,8 @@
   "Select a file to preview": "Datei zur Vorschau auswählen",
   "Pick any document from the list on the left to view it here without leaving the knowledge base.": "Wähle ein beliebiges Dokument aus der Liste links, um es hier anzuzeigen, ohne die Knowledge Base zu verlassen.",
   "Collapse": "Einklappen",
+  "Collapse composer": "Eingabefeld einklappen",
+  "Expand composer": "Eingabefeld ausklappen",
   "Expand": "Ausklappen",
   "Show file list": "Dateiliste anzeigen",
   "Hide file list": "Dateiliste ausblenden",

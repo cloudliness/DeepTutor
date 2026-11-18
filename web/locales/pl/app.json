@@ -1131,6 +1131,8 @@
   "Select a file to preview": "Wybierz plik do podglądu",
   "Pick any document from the list on the left to view it here without leaving the knowledge base.": "Wybierz dowolny dokument z listy po lewej stronie, aby go tutaj wyświetlić, nie opuszczając bazy wiedzy.",
   "Collapse": "Zwiń",
+  "Collapse composer": "Zwiń pole wiadomości",
+  "Expand composer": "Rozwiń pole wiadomości",
   "Expand": "Rozwiń",
   "Show file list": "Pokaż listę plików",
   "Hide file list": "Ukryj listę plików",

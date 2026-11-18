@@ -4,9 +4,10 @@ import {
   memo,
   useCallback,
   useEffect,
-  useLayoutEffect,
+  useId,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactNode,
   type RefObject,
 } from "react";
@@ -26,6 +27,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   ClipboardList,
   Database,
   Loader2,
@@ -64,6 +66,11 @@ import KnowledgeSelector from "./KnowledgeSelector";
 import ModelSelector from "./ModelSelector";
 import styles from "./ChatComposer.module.css";
 import { ComposerTray, type TrayCreate, type TrayMode } from "./ComposerTray";
+import {
+  readComposerCollapsed,
+  subscribeComposerCollapsed,
+  writeComposerCollapsed,
+} from "./composer-collapsed";
 import type { AnswerModeProps, PartnerLinkProps } from "./AnswerModeMenu";
 import type { LeadToken } from "./ComposerLead";
 import { modeIcon } from "./ComposerIcons";
@@ -798,9 +805,96 @@ export default memo(function ChatComposer({
     [onAddFiles],
   );
 
-  const focusTextarea = useCallback(() => {
+  const composerPanelId = useId();
+  const composerCollapsed = useSyncExternalStore(
+    subscribeComposerCollapsed,
+    readComposerCollapsed,
+    () => false,
+  );
+  const pendingFocusRef = useRef(false);
+  const pendingSeedRef = useRef<string | null>(null);
+
+  const applyPendingFocus = useCallback(() => {
+    if (!pendingFocusRef.current && !pendingSeedRef.current) return;
+    pendingFocusRef.current = false;
+    const seed = pendingSeedRef.current;
+    pendingSeedRef.current = null;
+    if (seed) {
+      const handle = inputHandleRef.current;
+      const current = handle?.getValue() ?? "";
+      handle?.setValue(current ? `${current}${seed}` : seed);
+      return;
+    }
     requestAnimationFrame(() => textareaRef.current?.focus());
   }, []);
+
+  const expandComposer = useCallback(
+    (seed?: string) => {
+      if (seed) pendingSeedRef.current = `${pendingSeedRef.current ?? ""}${seed}`;
+      pendingFocusRef.current = true;
+      if (readComposerCollapsed()) {
+        writeComposerCollapsed(false);
+        return;
+      }
+      applyPendingFocus();
+    },
+    [applyPendingFocus],
+  );
+
+  const collapseComposer = useCallback(() => {
+    if (awaitingUserReply) return;
+    writeComposerCollapsed(true);
+  }, [awaitingUserReply]);
+
+  const focusTextarea = useCallback(() => {
+    expandComposer();
+  }, [expandComposer]);
+
+  useEffect(() => {
+    if (!composerCollapsed) applyPendingFocus();
+  }, [applyPendingFocus, composerCollapsed]);
+
+  useEffect(() => {
+    if (awaitingUserReply && readComposerCollapsed()) {
+      pendingFocusRef.current = true;
+      writeComposerCollapsed(false);
+    }
+  }, [awaitingUserReply]);
+
+  useEffect(() => {
+    if (!composerCollapsed) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.repeat ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.altKey ||
+        event.isComposing
+      ) {
+        return;
+      }
+      // Space still scrolls the page, and Enter/Space activate the bar itself.
+      if (event.key.length !== 1 || event.key === " ") return;
+      const target = event.target;
+      if (target instanceof HTMLElement) {
+        if (target.closest("input, textarea, select, [contenteditable='true']")) return;
+        const onCollapsedBar = Boolean(target.closest("[data-composer-collapsed]"));
+        if (
+          !onCollapsedBar &&
+          target.closest(
+            "button, a, [role='button'], [role='link'], [role='menuitem'], [role='dialog'], [role='menu']",
+          )
+        ) {
+          return;
+        }
+      }
+      event.preventDefault();
+      expandComposer(event.key);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [composerCollapsed, expandComposer]);
 
   useEffect(() => {
     if (!focusInputRef) return;
@@ -835,8 +929,10 @@ export default memo(function ChatComposer({
   }, [focusTextarea]);
 
   useEffect(() => {
-    if (!hasMessages) focusTextarea();
-  }, [hasMessages, focusTextarea]);
+    if (!hasMessages && !composerCollapsed) {
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    }
+  }, [composerCollapsed, hasMessages]);
 
   const handleSelectCapability = useCallback(
     (value: string) => {
@@ -1277,6 +1373,50 @@ export default memo(function ChatComposer({
       )}
 
       <div className="relative">
+        {composerCollapsed ? (
+          <div data-composer-collapsed="" className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => expandComposer()}
+              aria-expanded={false}
+              aria-controls={composerPanelId}
+              aria-label={t("Expand composer")}
+              className="flex h-11 min-w-0 flex-1 items-center gap-2 rounded-[26px] border border-[var(--border)]/55 bg-[var(--card)] px-4 text-left text-[13px] text-[var(--muted-foreground)] shadow-[0_1px_2px_rgba(0,0,0,0.025),0_10px_28px_-10px_rgba(0,0,0,0.08)] transition-colors hover:text-[var(--foreground)]"
+            >
+              <ChevronUp size={16} strokeWidth={1.8} className="shrink-0" />
+              <span className="min-w-0 flex-1 truncate">{t("Ask a question")}</span>
+              <span className="shrink-0 text-[12px] font-medium">{t("Expand")}</span>
+            </button>
+            {streamingBlocksSend ? (
+              <Tooltip label={t("Stop generating")} side="top">
+                <button
+                  type="button"
+                  onClick={onCancelStreaming}
+                  aria-label={t("Stop generating")}
+                  className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-[var(--border)]/55 bg-[var(--card)] text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
+                >
+                  <Square size={12} strokeWidth={2.4} className="fill-current" />
+                </button>
+              </Tooltip>
+            ) : null}
+          </div>
+        ) : (
+          <div className="mb-1.5 flex justify-end pr-1">
+            <Tooltip label={t("Collapse")} side="top">
+              <button
+                type="button"
+                onClick={collapseComposer}
+                aria-expanded
+                aria-controls={composerPanelId}
+                aria-label={t("Collapse composer")}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-full text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)]/55 hover:text-[var(--foreground)]"
+              >
+                <ChevronDown size={16} strokeWidth={1.8} />
+              </button>
+            </Tooltip>
+          </div>
+        )}
+        <div id={composerPanelId} hidden={composerCollapsed || undefined}>
         <div
           className={`${styles.surface} dt-composer-surface relative rounded-[26px] border bg-[var(--card)] shadow-[0_1px_2px_rgba(0,0,0,0.025),0_10px_28px_-10px_rgba(0,0,0,0.08)] transition-colors ${
             dragging
@@ -1668,6 +1808,7 @@ export default memo(function ChatComposer({
             end={trayEnd}
           />
         ) : null}
+        </div>
       </div>
     </div>
   );

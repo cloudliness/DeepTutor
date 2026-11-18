@@ -1237,6 +1237,8 @@
   "Select a file to preview": "Select a file to preview",
   "Pick any document from the list on the left to view it here without leaving the knowledge base.": "Pick any document from the list on the left to view it here without leaving the knowledge base.",
   "Collapse": "Collapse",
+  "Collapse composer": "Collapse composer",
+  "Expand composer": "Expand composer",
   "Expand": "Expand",
   "Show file list": "Show file list",
   "Hide file list": "Hide file list",
